@@ -1,0 +1,16 @@
+add vendor example123 example123@gmail.com     → name "example123", email set
+add vendor Handy Fix LLC ops@handyfix.com      → name "Handy Fix LLC"
+new customer Acme Corp, sales@acme.com, phone 555-0143
+
+261203000154 update amount 500      ← your line
+261203000154 amount 500
+261203000154 update category Printing, date 06/10/2026
+261203000154 void
+261203000154 show
+261203000154                        ← bare id shows the voucher
+
+1.  Received $8,750 from Medicare for Healthcare Services into Bank of Amercia 9523 on 06/07/2026
+2.  Received $4,120 from Aetna for Healthcare Services via Bank of Amercia 9523
+3.  Received $659.25 from John Smith for REVENUE/Healthcare Services, cheque 8891
+4.  06/07/2026 ACH DEPOSIT - AETNA 4,120.00
+5.  Received $2,000 from Adobe Identity Verification Service LLC for Healthcare Services into Current Assets
