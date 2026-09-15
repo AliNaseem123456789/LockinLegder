@@ -122,11 +122,11 @@ import time
 import traceback
 import unicodedata
 from difflib import SequenceMatcher
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime, timedelta, date
+from typing import Optional, List, Dict, Any, Tuple, NamedTuple
 
 import mysql.connector
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
@@ -382,6 +382,14 @@ MODE_HINT = {
     'editchart': 'the user pressed "Rename or retire an account", so they are '
                  'probably renaming or deactivating an existing ledger account',
     'chartview': 'the user pressed "View chart of accounts"',
+    # This one is here so the mode is never silently unknown, but it is not a
+    # typed grammar: the button opens a file picker, and a statement is read by
+    # the deterministic reader alone. If a sentence arrives under this mode at
+    # all, the person has typed something else while the panel was open, so the
+    # hint says to treat it as ordinary.
+    'statement': 'the user pressed "Read a statement", which uploads a file '
+                 'rather than typing - so anything typed here is an ordinary '
+                 'request and the mode says nothing about it',
 }
 _VOICE_OFF = False          # set once a voice call fails; see _voice()
 
@@ -967,6 +975,473 @@ def _rule_based_extract(message: str) -> Dict[str, Any]:
     if not out["party_name"]:
         return {"action": "help"}
     return out
+
+
+# --------------------------------------------------------------------------
+# Reading a bank statement.
+#
+# A statement is the same job as typing, done 60 times. So it is deliberately
+# NOT a new way to write to the ledger: the reader below turns a PDF into the
+# same resolved-but-unwritten drafts a typed sentence produces, and they come
+# back as the queue a bulk edit already uses. Every row is still read and
+# saved one at a time, by code, through /api/commit.
+#
+#   The typing is bulk. The writing never is. Now the reading is too.
+#
+# Two layouts are understood, because they are the two the operator actually
+# has:
+#
+#   1. a bank/checking statement, where DIRECTION COMES FROM THE SECTION the
+#      row sits in - "DEPOSITS AND ADDITIONS" vs "ELECTRONIC WITHDRAWALS".
+#      The rows themselves carry no sign at all, so the heading is the only
+#      signal there is, and losing track of it would reverse every voucher
+#      under it.
+#   2. a credit-card statement, where there are no sections and direction
+#      comes from the SIGN - a negative amount is a payment to the card, a
+#      positive one is a purchase.
+#
+# Anything that matches neither is read line by line with the existing
+# single-line reader, and a row whose direction is still unknowable is
+# skipped and named rather than guessed at.
+# --------------------------------------------------------------------------
+
+# Rows carry MM/DD and nothing else, so the year lives in the statement header
+# and nowhere else on the page. Getting this wrong posts a whole statement
+# into the wrong fiscal year, so it is read explicitly rather than assumed to
+# be "now" - a January statement is very often read in February, and a
+# December-to-January one straddles two years at once.
+_STMT_PERIOD_RES = [
+    # "August 01, 2025 through August 29, 2025"
+    re.compile(r'(?P<m1>[A-Z][a-z]+)\s+(?P<d1>\d{1,2}),?\s+(?P<y1>\d{4})\s+'
+               r'(?:through|to|-|–)\s+'
+               r'(?P<m2>[A-Z][a-z]+)\s+(?P<d2>\d{1,2}),?\s+(?P<y2>\d{4})'),
+    # "Opening/Closing Date  08/05/25 - 09/04/25"
+    re.compile(r'(?P<mm1>\d{1,2})/(?P<dd1>\d{1,2})/(?P<yy1>\d{2,4})\s*(?:-|–|through|to)\s*'
+               r'(?P<mm2>\d{1,2})/(?P<dd2>\d{1,2})/(?P<yy2>\d{2,4})'),
+]
+
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+     'August', 'September', 'October', 'November', 'December'], start=1)}
+
+# "Account Number: 000000588379993" / "Account Number: XXXX XXXX XXXX 8704"
+_STMT_ACCT_RE = re.compile(
+    r'account\s*(?:number|no\.?|#)\s*[:\-]?\s*'
+    r'(?P<acct>[X\*x\d][X\*x\d\s\-]{3,30}\d)', re.IGNORECASE)
+
+# A row in either layout: MM/DD (or MM/DD/YY), then text, then the amount at
+# the end of the line. The amount may be signed, bracketed, or carry a $.
+# The gap after the date is ONE space or more, not two: how wide it comes out
+# depends entirely on which extractor read the PDF. pdftotext -layout pads the
+# columns out; pdfplumber gives "08/01 Zelle Payment To ... $150.00" with a
+# single space, and requiring two silently dropped four rows in five while
+# still looking like it had read the file.
+#
+# The same collapse happens in front of the amount on a long description, so
+# the column gap can't be relied on there either. What CAN be relied on is
+# that the amount is the last thing on the line and has cents: the pattern is
+# anchored to the end and requires ".dd", so a reference number in the middle
+# of the description - "Zelle Payment To Yadel 25725052480" - cannot be
+# mistaken for it however the spacing comes out.
+_STMT_ROW_RE = re.compile(
+    r'^\s{0,40}(?P<mm>\d{1,2})/(?P<dd>\d{1,2})(?:/(?P<yy>\d{2,4}))?\s+'
+    r'(?P<body>\S.*?)\s+'
+    r'(?P<open>\()?\s*(?P<sign>[-+])?\s*\$?\s*'
+    r'(?P<amt>\d[\d,]*\.\d{2})\s*(?P<close>\))?\s*(?P<trail>-)?\s*$')
+
+# The cost of that looseness: a DAILY ENDING BALANCE table is three columns of
+# date-and-amount pairs, and its last pair would now read as a transaction.
+# The heading above it normally stops the reader before it gets there, but a
+# statement that words that heading differently would post thirty balances as
+# vouchers. A date followed by an amount INSIDE the description is the
+# signature of that table and of nothing else.
+_STMT_BALANCE_ROW_RE = re.compile(r'\d{1,2}/\d{1,2}\s+\$?[\d,]+\.\d{2}')
+
+# A heading is bare words. The CHECKING SUMMARY block at the top of the page
+# repeats every section's name beside its total - "Electronic Withdrawals 36
+# -28,654.16" - and reading that as a heading re-opened a section that the
+# summary had just closed, so the rows under the NEXT heading inherited the
+# wrong direction. A line carrying an amount is a total, never a heading.
+_STMT_MONEY_RE = re.compile(r'\d[\d,]*\.\d{2}')
+
+# Section headings on a checking statement, and what each one means. Order
+# matters only in that the first match wins on a given line.
+_STMT_SECTIONS: List[Tuple[re.Pattern, Optional[str], str]] = [
+    (re.compile(r'\bDEPOSITS?\s+AND\s+ADDITIONS?\b', re.I), 'CRV', 'Deposits and additions'),
+    (re.compile(r'\bDEPOSITS?\b(?!\s+and\s+withdrawal)', re.I), 'CRV', 'Deposits'),
+    (re.compile(r'\bELECTRONIC\s+WITHDRAWALS?\b', re.I), 'CPV', 'Electronic withdrawals'),
+    (re.compile(r'\bATM\s*&?\s*DEBIT\s+CARD\s+WITHDRAWALS?\b', re.I), 'CPV', 'Card withdrawals'),
+    (re.compile(r'\bOTHER\s+WITHDRAWALS?\b', re.I), 'CPV', 'Other withdrawals'),
+    (re.compile(r'\bCHECKS?\s+PAID\b', re.I), 'CPV', 'Checks paid'),
+    (re.compile(r'\bWITHDRAWALS?\s+AND\s+DEBITS?\b', re.I), 'CPV', 'Withdrawals'),
+    (re.compile(r'\bFEES?(?:\s+AND\s+CHARGES?)?\s*$', re.I), 'CPV', 'Fees'),
+    (re.compile(r'\bACCOUNT\s+ACTIVITY\b', re.I), None, 'Card activity'),
+    (re.compile(r'\bTRANSACTIONS?\b\s*$', re.I), None, 'Transactions'),
+]
+
+# Headings that END the transaction part of the page. A running-balance table
+# is full of dates and amounts and would otherwise read as 30 more vouchers.
+_STMT_STOP_RE = re.compile(
+    r'\b(DAILY\s+ENDING\s+BALANCE|ENDING\s+BALANCE|CHECKING\s+SUMMARY|'
+    r'ATM\s*&?\s*DEBIT\s+CARD\s+SUMMARY|INTEREST\s+CHARGES?|'
+    r'ACCOUNT\s+SUMMARY|SUMMARY\s+OF\s+ACCOUNT|IN\s+CASE\s+OF\s+ERRORS|'
+    r'YEAR-TO-DATE|Totals\s+Year-to-Date)\b', re.I)
+
+# Lines inside a section that are totals, not transactions.
+_STMT_TOTAL_RE = re.compile(r'^\s*(total|subtotal|beginning|ending|previous)\b', re.I)
+
+# Whether a line is a HEADING at all, before asking which one it is.
+#
+# The patterns above were matching prose: a paragraph of card small print
+# containing the word "deposits" opened a DEPOSITS section, and every purchase
+# under it was then read as money coming IN. An inverted voucher is the worst
+# thing this reader can produce, and one sentence of legalese was enough.
+#
+# A real heading is short and shouted. Both conditions are needed - "FEES" is
+# short but so is half the page, and a long ALL-CAPS line is a disclaimer.
+def _stmt_is_heading(line: str) -> bool:
+    s = _stmt_undouble(line).strip()
+    return bool(s) and len(s) <= 60 and not re.search(r'[a-z]', s)
+
+
+# pdfplumber renders faux-bold text by drawing it twice, so a bold heading
+# arrives as "AACCCCOOUUNNTT AACCTTIIVVIITTYY" and matches nothing. The
+# collapse is only applied when EVERY letter is doubled, which is what that
+# artifact looks like and what an English word does not.
+_STMT_DOUBLED_RE = re.compile(r'\b(?:([A-Za-z])\1)+\b')
+
+
+def _stmt_undouble(line: str) -> str:
+    return _STMT_DOUBLED_RE.sub(
+        lambda m: m.group(0)[::2], line)
+
+
+class StatementRow(NamedTuple):
+    """One line of a statement, before anything has been looked up."""
+    date: str                 # YYYY-MM-DD
+    description: str          # as printed
+    amount: float             # always positive
+    entry_type: Optional[str]  # CRV | CPV | None when unknowable
+    section: str
+    line_no: int
+
+
+def _stmt_year_window(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """(start_month, start_year, end_year) from the statement header."""
+    head = text[:6000]
+    for rx in _STMT_PERIOD_RES:
+        m = rx.search(head)
+        if not m:
+            continue
+        g = m.groupdict()
+        if g.get('m1'):
+            m1 = _MONTHS.get(g['m1'].lower())
+            if not m1:
+                continue
+            return m1, int(g['y1']), int(g['y2'])
+        y1, y2 = int(g['yy1']), int(g['yy2'])
+        y1 += 2000 if y1 < 100 else 0
+        y2 += 2000 if y2 < 100 else 0
+        return int(g['mm1']), y1, y2
+    return None, None, None
+
+
+def _stmt_account_hint(text: str) -> Optional[str]:
+    """The last four digits of the account the statement belongs to."""
+    m = _STMT_ACCT_RE.search(text[:8000])
+    if not m:
+        return None
+    digits = re.sub(r'\D', '', m.group('acct'))
+    return digits[-4:] if len(digits) >= 4 else None
+
+
+def _stmt_attach_continuations(rows: List['StatementRow'],
+                               lines: List[str]) -> List['StatementRow']:
+    """Glue a wrapped row's trailing lines back onto its description."""
+    starts = {r.line_no for r in rows}
+    out: List[StatementRow] = []
+    for idx, r in enumerate(rows):
+        stop = rows[idx + 1].line_no if idx + 1 < len(rows) else len(lines) + 1
+        extra: List[str] = []
+        for j in range(r.line_no, min(stop - 1, r.line_no + 5)):
+            if (j + 1) in starts:
+                break
+            nxt = lines[j].strip() if j < len(lines) else ''
+            if not nxt:
+                continue
+            # A continuation is indented text with no date and no heading. A
+            # blank line does not end it - the layout extractor double-spaces
+            # everything - but another row or a heading does.
+            if _STMT_ROW_RE.match(lines[j]) or _STMT_STOP_RE.search(nxt):
+                break
+            if any(rx.search(nxt) for rx, _e, _l in _STMT_SECTIONS):
+                break
+            if re.match(r'^(page\s+\d|\*|total\b)', nxt, re.IGNORECASE):
+                break
+            extra.append(nxt)
+        if extra:
+            joined = re.sub(r'\s{2,}', ' ', ' '.join([r.description] + extra)).strip()
+            r = r._replace(description=joined[:400])
+        out.append(r)
+    return out
+
+
+def parse_statement_text(text: str) -> Dict[str, Any]:
+    """
+    A statement as rows, with nothing looked up and nothing written.
+
+    Pure text in, plain dicts out - no database, no network, no model. That
+    is deliberate: this is the part most likely to meet a layout it has never
+    seen, and it should be testable from a string.
+    """
+    lines = (text or '').splitlines()
+    start_month, start_year, end_year = _stmt_year_window(text)
+    acct = _stmt_account_hint(text)
+
+    rows: List[StatementRow] = []
+    unreadable: List[Dict[str, Any]] = []
+    section, section_type = '', None
+    stopped = False
+
+    for i, raw in enumerate(lines):
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+
+        # A section heading, or the end of the transactional part of the page.
+        if not _STMT_ROW_RE.match(line):
+            if _STMT_STOP_RE.search(_stmt_undouble(line)):
+                section, section_type, stopped = '', None, True
+                continue
+            if _STMT_MONEY_RE.search(line) or not _stmt_is_heading(line):
+                continue
+            plain = _stmt_undouble(line)
+            for rx, etype, label in _STMT_SECTIONS:
+                if rx.search(plain):
+                    section, section_type, stopped = label, etype, False
+                    break
+            continue
+
+        if stopped:
+            continue
+
+        m = _STMT_ROW_RE.match(line)
+        body = m.group('body').strip()
+        if _STMT_TOTAL_RE.match(body) or _STMT_TOTAL_RE.match(line.strip()):
+            continue
+        if _STMT_BALANCE_ROW_RE.search(body):
+            continue
+
+        try:
+            amount = float(m.group('amt').replace(',', ''))
+        except ValueError:
+            continue
+        if amount == 0:
+            continue
+
+        # A trailing '-' is how some statements mark a credit ("$1.87-").
+        negative = (m.group('sign') == '-'
+                    or bool(m.group('open') and m.group('close'))
+                    or m.group('trail') == '-')
+
+        mm, dd = int(m.group('mm')), int(m.group('dd'))
+        if not (1 <= mm <= 12 and 1 <= dd <= 31):
+            continue
+        yy = m.group('yy')
+        if yy:
+            year = int(yy) + (2000 if int(yy) < 100 else 0)
+        elif start_year:
+            # A period that crosses New Year prints December and January rows
+            # with the same MM/DD shape; the month decides which year it is.
+            year = start_year if (start_month is None or mm >= start_month) else (end_year or start_year)
+        else:
+            year = datetime.now().year
+        try:
+            iso = date(year, mm, dd).isoformat()
+        except ValueError:
+            unreadable.append({'line': i + 1, 'text': line.strip(),
+                               'why': 'the date is not a real one'})
+            continue
+
+        # Direction: the section if there is one, otherwise the sign. On a
+        # card statement a NEGATIVE amount is money leaving the card account
+        # (a payment received against it), and a positive one is a purchase.
+        etype = section_type
+        if etype is None:
+            etype = 'CRV' if negative else 'CPV'
+            if not section:
+                # No section heading at all and no sign either way: fall back
+                # to the wording, and admit it when that says nothing.
+                if not negative:
+                    if _STMT_CREDIT_RE.search(body):
+                        etype = 'CRV'
+                    elif _STMT_DEBIT_RE.search(body):
+                        etype = 'CPV'
+                    else:
+                        etype = None
+        elif negative and section_type:
+            # A negative number inside a named section contradicts the
+            # heading - a refund inside a withdrawals block, say. The sign
+            # wins, because it is on the row itself.
+            etype = 'CRV' if section_type == 'CPV' else 'CPV'
+
+        if etype is None:
+            unreadable.append({'line': i + 1, 'text': line.strip(),
+                               'why': 'nothing says whether money came in or went out'})
+            continue
+
+        rows.append(StatementRow(date=iso, description=re.sub(r'\s{2,}', ' ', body),
+                                 amount=abs(amount), entry_type=etype,
+                                 section=section or ('Card activity' if not section_type else ''),
+                                 line_no=i + 1))
+
+    # An ACH row wraps over three or four lines - the date and the amount are
+    # on the first, and the useful half of the name ("Ind Name:...") is on the
+    # last. Dropping the continuation loses the part a person would read, so
+    # it is glued back onto the row it belongs to.
+    if rows:
+        rows = _stmt_attach_continuations(rows, lines)
+
+    return {
+        'rows': rows,
+        'unreadable': unreadable,
+        'account_hint': acct,
+        'period': ({'start_year': start_year, 'end_year': end_year}
+                   if start_year else None),
+        'layout': ('checking' if any(r.section and 'Card' not in r.section for r in rows)
+                   else ('card' if rows else 'unknown')),
+    }
+
+
+# --- pulling a counterparty out of a statement description -----------------
+#
+# A description is not a sentence; it is a machine's audit trail with a name
+# somewhere inside it. What matters is stripping the confirmation ids, because
+# "Zelle Payment From Kevin B Becker 25697289472" and the same payment next
+# month carry different ids and would otherwise never match the same profile.
+
+_STMT_NOISE_RE = re.compile(
+    r'\b(?:'
+    r'\d{9,}'                              # 25697289472 - never part of a name
+    r'|trn|tc|eed|sec|ccd|ppd|web|ach|eft|pos'
+    r'|trace#?|ind\s+id|orig\s+id|desc\s+date|co\s+entry\s+descr'
+    r'|transaction#?|confirmation#?|ref#?|id#?'
+    r')\b[:#]?\s*', re.IGNORECASE)
+
+# A Zelle or ACH line ends in a confirmation code - "Cof4Xqdg85O7",
+# "Ctinqwoggugc", "Jpm99Bhveu4W". It changes every time, so leaving it on
+# means the same payer never matches the same profile twice.
+#
+# It is stripped as the LAST TOKEN rather than by what it looks like, because
+# what it looks like is a surname: "Kellie Maisenbacher Ctinqwoggugc" has two
+# twelve-letter words in a row and only one of them is a person. Position is
+# the reliable signal; spelling is not. And it never strips the only token it
+# has, so "Roula38Thstreet" survives being the whole name.
+_STMT_TAIL_CODE_RE = re.compile(r'\s+[A-Za-z0-9]{8,}\s*$')
+
+_STMT_PARTY_RES = [
+    # "Orig CO Name:Nys Dtf Wt    Orig ID:..."  -> the originating company
+    (re.compile(r'orig\s+co\s+name\s*:\s*(?P<who>.+?)(?=\s+orig\s+id|\s*:|$)',
+                re.IGNORECASE), None),
+    # "Zelle Payment From Kevin B Becker 256..." / "... To Yadel 257..."
+    (re.compile(r'\b(?:zelle|venmo|cash\s*app)\s+payment\s+(?:from|to)\s+(?P<who>.+)$',
+                re.IGNORECASE), 'coded'),
+    # "08/04 Online ACH Payment 11182566613 To Santosa (_######4994)"
+    (re.compile(r'\b(?:online|same-day|recurring)?\s*ach\s+(?:payment|debit|credit|deposit)\s*'
+                r'\d*\s*(?:to|from)\s+(?P<who>[^(]+)', re.IGNORECASE), 'coded'),
+    # "Recurring Card Purchase 08/12 Spectrum 855-707-7328 MO Card 1284"
+    (re.compile(r'\bcard\s+(?:purchase|payment)\s+(?:\d{1,2}/\d{1,2}\s+)?(?P<who>.+?)'
+                r'(?=\s+\d{3}[-.]\d{3}|\s+card\s+\d|$)', re.IGNORECASE), None),
+    # "Online Transfer To Chk ...1690 Transaction#: 258..."  - an own account
+    (re.compile(r'\b(?:online\s+)?transfer\s+(?:to|from)\s+(?P<who>(?:chk|sav|savings|checking)'
+                r'\s*\.*\s*\d+)', re.IGNORECASE), 'transfer'),
+    # A generic trailing "to X" / "from X"
+    (re.compile(r'\b(?:paid\s+to|payment\s+to|to|from)\s+(?P<who>[A-Za-z][^:()]{2,60})$',
+                re.IGNORECASE), None),
+]
+
+# Descriptions that name no counterparty at all - the bank itself is the other
+# side. Guessing a vendor from "Monthly Service Fee" would create a profile
+# called "Monthly Service".
+_STMT_BANK_ITSELF_RE = re.compile(
+    r'\b(monthly\s+service\s+fee|service\s+charge|maintenance\s+fee|overdraft'
+    r'|returned\s+item|nsf|interest\s+(?:charge|earned|paid)|annual\s+fee'
+    r'|late\s+fee|wire\s+fee|atm\s+fee|standard\s+ach\s+pmnts?\s+initial\s+fee'
+    r'|remote\s+online\s+deposit|mobile\s+deposit|counter\s+credit'
+    r'|automatic\s+payment)\b', re.IGNORECASE)
+
+
+def statement_party(description: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    (party name, why-there-isn't-one). A statement line that names no
+    counterparty is not a broken line - a service fee genuinely has none -
+    so the caller shows the row with an empty party for the operator to fill,
+    rather than inventing a vendor from the fee's own wording.
+    """
+    desc = re.sub(r'\s{2,}', ' ', (description or '').strip())
+    if not desc:
+        return None, 'the line has no description'
+
+    if _STMT_BANK_ITSELF_RE.search(desc):
+        return None, 'this is the bank itself, not a customer or vendor'
+
+    who, coded = None, False
+    for rx, kind in _STMT_PARTY_RES:
+        m = rx.search(desc)
+        if m:
+            who, coded = m.group('who'), (kind == 'coded')
+            break
+    if not who:
+        who = desc
+
+    who = re.sub(r'\(_?#+\d+\)', ' ', who)          # (_######4994)
+    # The tail code goes FIRST. Stripping the long digit strings first would
+    # remove the real code and leave the tail rule to eat the last word of the
+    # name instead - "464 Putnam Avenue Condominium" losing its Condominium.
+    if coded:
+        trimmed = _STMT_TAIL_CODE_RE.sub('', who.strip())
+        if re.search(r'[A-Za-z]{2}', trimmed):
+            who = trimmed
+    who = _STMT_NOISE_RE.sub(' ', who)
+    who = re.sub(r'\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b', ' ', who)
+    # A card line ends in the merchant's phone number and state - "Public
+    # Storage 77601 800-567-0759 NY". None of that is the vendor's name, and
+    # leaving it in means the same vendor never matches itself twice.
+    who = re.sub(r'\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b', ' ', who)
+    who = re.sub(r'\s+[A-Z]{2}\s*$', ' ', who)
+    who = re.sub(r'\s+\d{4,}\s*', ' ', who)
+    who = re.sub(r'[.,;:#]+$', '', who.strip())
+    who = re.sub(r'\s+', ' ', who).strip(' .,-&*/')
+    # A name that is now only digits, or a single letter, is not a name.
+    if not who or len(who) < 2 or not re.search(r'[A-Za-z]{2}', who):
+        return None, 'no name could be read out of the description'
+    if len(who) > 80:
+        who = who[:80].rsplit(' ', 1)[0]
+    return who, None
+
+
+# Money moving between two accounts the company already owns. This is the one
+# reading that is dangerous to accept quietly: a card autopay or a sweep into
+# savings posted as a CRV invents revenue that never happened, and the row
+# looks exactly like a deposit while it does it. So it is still offered as a
+# draft - the operator may well want it, with the other account as the second
+# leg - but it is flagged loudly rather than slipped through.
+_STMT_TRANSFER_RE = re.compile(
+    r'\b(?:online\s+)?transfer\s+(?:to|from)\b'
+    r'|\bautomatic\s+payment\b|autopay|\bpayment\s*-\s*thank\s+you\b'
+    r'|\bto\s+(?:chk|sav|savings|checking)\b|\bfrom\s+(?:chk|sav|savings|checking)\b',
+    re.IGNORECASE)
+
+
+def _pretty_date(iso: str) -> str:
+    try:
+        return datetime.strptime(iso, '%Y-%m-%d').strftime('%m/%d/%Y')
+    except Exception:
+        return iso or ''
+
+
+def statement_is_transfer(description: str) -> bool:
+    return bool(_STMT_TRANSFER_RE.search(description or ''))
 
 
 def _looks_transactional(message: str) -> bool:
@@ -2084,6 +2559,27 @@ def _resolve(conn, search_text: str, candidates: List[Dict],
             f"“{row['desc']}” is a heading, not a postable account")
 
     return Resolution(row, mtype, score), None
+
+
+def _accounts_ending(conn, digits: str) -> List[Dict]:
+    """
+    Postable accounts whose NAME carries this number - "Chase Bank 9993".
+
+    A statement identifies itself by account number and by nothing else, and
+    the number is how people name these accounts in the chart too. This is
+    kept separate from the general matcher on purpose: it is a rule about
+    statements, where the number is authoritative, not about typing, where a
+    bare number is far more likely to be a code or an amount.
+    """
+    digits = re.sub(r'\D', '', digits or '')
+    if len(digits) < 4:
+        return []
+    out = []
+    for row in get_chart(conn):
+        tokens = re.findall(r'\d+', f"{row.get('desc') or ''} {row.get('parent_desc') or ''}")
+        if any(t == digits or t.endswith(digits) for t in tokens):
+            out.append(row)
+    return out
 
 
 def resolve_bank_account(conn, search_text: str,
@@ -3211,8 +3707,7 @@ class AccountingBot:
         # The model name doesn't depend on whether a key was found - keeping it
         # unconditional means anything that reads self.model (the voice pass,
         # /api/debug/extract) works the same however the client got attached.
-        # self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        self.model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         if api_key:
             self.groq_client = Groq(api_key=api_key)
             print(f"Groq client initialized ({self.model})")
@@ -4289,6 +4784,316 @@ Return ONLY valid JSON, no markdown, no extra text.
             'vouchers': rows, 'editable_count': len(editable),
         })
 
+    # ----------------------------------------------------------------------
+    # A statement, as drafts.
+    #
+    # This deliberately adds NO way to write. Every row is resolved with the
+    # same three resolvers a typed sentence uses, packaged by the same
+    # _draft_payload, and handed back as the queue a bulk edit already
+    # produces - so it is saved one row at a time through /api/commit, by
+    # code, after a person has read it. Importing sixty vouchers and posting
+    # sixty vouchers stay two different acts.
+    # ----------------------------------------------------------------------
+    async def handle_statement_import(self, conn, parsed: Dict[str, Any], *,
+                                      filename: str = '',
+                                      bank_text: Optional[str] = None) -> Dict:
+        rows = parsed.get('rows') or []
+        if not rows:
+            t = ("I couldn't find any transactions in that file. I can read a "
+                 "bank or credit-card statement as a PDF, or a plain text or "
+                 "CSV export of one - each line needs a date, a description "
+                 "and an amount.\n\nIf it's a scanned image rather than a "
+                 "digital statement, there's no text in it to read; export it "
+                 "from your bank as a PDF or CSV instead.")
+            return {'status': 'error', 'message': t, 'analysis': t,
+                    'confidence': 'low', '_final': True}
+
+        # ---- The cash leg, once, for the whole statement -------------------
+        # Every row moves through the same account - that is what makes it a
+        # statement. Leaving it unresolved would mean sixty drafts each
+        # missing the identical field, so this one refuses up front instead.
+        named = (bank_text or '').strip()
+        bank_res = None
+        if named:
+            bank_res, _bank_err = resolve_bank_account(conn, named, allow_default=False)
+        if not bank_res and parsed.get('account_hint'):
+            # A statement identifies itself by number and nothing else, and a
+            # bare "9993" is not a name the general matcher can use - it looks
+            # like an account code, matches none, and falls through to a fuzzy
+            # score against words. So the number is matched against the
+            # account names directly, and ONLY when exactly one carries it:
+            # two accounts ending 9993 is a question for the operator, not a
+            # coin toss over which one gets a month of transactions.
+            hits = _accounts_ending(conn, parsed['account_hint'])
+            if len(hits) == 1:
+                bank_res = Resolution(hits[0], 'statement_number', 0.95)
+        if not bank_res:
+            hint_no = parsed.get('account_hint')
+            many = _accounts_ending(conn, hint_no) if hint_no and not named else []
+            # When the number narrowed it to a handful, offer those; otherwise
+            # offer the usual sample. Either way the operator picks from real
+            # accounts rather than retyping a number that already failed.
+            choices = ([{'code': a['code'], 'qualified': a['qualified']} for a in many]
+                       if many else
+                       [{'code': a['code'], 'qualified': a['qualified']}
+                        for a in get_chart(conn)[:200]])
+            names = ([a['qualified'] for a in many] if many
+                     else _bank_samples(conn, 4))
+            listed = ("\n\nYours include:\n" + "\n".join(f"  - {n}" for n in names)
+                      if names else "")
+            if named:
+                said = f"I couldn't match \"{named}\" to an account. "
+            elif len(many) > 1:
+                said = (f"{len(many)} of your accounts carry the number "
+                        f"{hint_no} ({', '.join(a['qualified'] for a in many)}), "
+                        f"so the statement doesn't say which one it is. ")
+            elif hint_no:
+                said = (f"The statement says account {hint_no}, but nothing in "
+                        f"your chart matches it. ")
+            else:
+                said = "The statement doesn't say which account it belongs to. "
+            t = (f"{said}I need to know which of your accounts this statement "
+                 f"belongs to before I can read it - every row posts through "
+                 f"it, so guessing would put the whole month in the wrong "
+                 f"place.{listed}\n\nUpload it again and name the account, or "
+                 f"pick it below. Nothing has been read in.")
+            return {'status': 'error', 'message': t, 'analysis': t,
+                    'confidence': 'low', 'action': 'statement_needs_bank',
+                    'card': {'kind': 'statement_bank_pick',
+                             'filename': filename,
+                             'choices': choices,
+                             'account_hint': parsed.get('account_hint'),
+                             'rows': len(rows)},
+                    '_final': True}
+
+        # ---- What is already in the ledger on these dates ------------------
+        # A statement that gets uploaded twice would otherwise double the
+        # month. Nothing is blocked on this - it is a flag, because a customer
+        # really can pay the same amount on the same day twice - but it is
+        # shown before the save, not discovered after it.
+        existing: Dict[str, List[Dict]] = {}
+        for d in sorted({r.date for r in rows}):
+            try:
+                existing[d] = list_vouchers(conn, limit=200, on_date=d)
+            except Exception:
+                existing[d] = []
+
+        drafts: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        seen_new_party: Dict[str, int] = {}
+
+        for n, r in enumerate(rows, start=1):
+            try:
+                draft = self._statement_row_draft(
+                    conn, r, bank_res=bank_res, existing=existing.get(r.date, []),
+                    index=n, filename=filename)
+            except Exception as e:
+                skipped.append({'line': r.line_no, 'date': r.date,
+                                'amount': r.amount,
+                                'text': r.description[:120],
+                                'why': _internal_error_message(e, "reading that line")})
+                continue
+            if draft.get('party_is_new') and draft.get('party_name'):
+                key = normalize_name(draft['party_name'])
+                seen_new_party[key] = seen_new_party.get(key, 0) + 1
+            drafts.append(draft)
+
+        for u in (parsed.get('unreadable') or []):
+            skipped.append({'line': u.get('line'), 'text': u.get('text', '')[:120],
+                            'why': u.get('why', 'could not be read')})
+
+        if not drafts:
+            t = ("I read the file but couldn't turn any line into a voucher. "
+                 "Nothing has been written.")
+            return {'status': 'error', 'message': t, 'analysis': t,
+                    'confidence': 'low', '_final': True,
+                    'card': {'kind': 'statement_summary', 'skipped': skipped,
+                             'filename': filename}}
+
+        return self._statement_reply(drafts, skipped, bank_res=bank_res,
+                                     parsed=parsed, filename=filename)
+
+    def _statement_row_draft(self, conn, r: 'StatementRow', *, bank_res,
+                             existing: List[Dict], index: int,
+                             filename: str) -> Dict[str, Any]:
+        """One statement row, resolved into the same draft a sentence makes."""
+        natures = CRV_INCOME_NATURES if r.entry_type == 'CRV' else CPV_EXPENSE_NATURES
+        party_name, party_why = statement_party(r.description)
+
+        # ---- Party: matched, never created --------------------------------
+        party_code = party_display = None
+        party_match_type, party_score = 'none', 0.0
+        party_type = P_TYPE_CUSTOMER if r.entry_type == 'CRV' else P_TYPE_VENDOR
+        if party_name:
+            found, _err = resolve_party_existing(conn, party_name, party_type)
+            if found:
+                party_code = str(found['p_code'])
+                party_display = found.get('matched_name') or party_name
+                party_type = found.get('p_type') or party_type
+                exact = normalize_name(party_display) == normalize_name(party_name)
+                party_match_type = 'exact' if exact else 'fuzzy'
+                party_score = 1.0 if exact else name_similarity(party_name, party_display)
+            else:
+                party_display = title_case_name(party_name)
+                party_match_type = 'new'
+        else:
+            party_display = ''
+
+        # ---- Category leg --------------------------------------------------
+        # The description is the only hint there is, and most of the time it
+        # names a person rather than an account. So a miss here is normal and
+        # is left as an empty field with a note, exactly as a typed line
+        # would be - not as a refusal, and never as a silent default that
+        # quietly files a month of income under one heading.
+        cat_res, cat_err = resolve_category_account(conn, r.description, natures)
+        if cat_res is None and cat_err is None:
+            kind = 'revenue' if r.entry_type == 'CRV' else 'expense'
+            raise ValueError(
+                f"There are no {kind} accounts in this company's chart yet, so "
+                f"there is nothing to post the other side of this row to.")
+        category_matched = cat_res is not None
+        cat_note = None
+        if not cat_res:
+            cat_res, _d = _default_category_resolution(conn, r.entry_type, natures)
+            if cat_res:
+                cat_note = AccountProblem(
+                    f"Nothing in the line named an account, so this is the "
+                    f"default ({cat_res.qualified}). Change it here if the row "
+                    f"belongs somewhere else.",
+                    "Defaulted - check it")
+            else:
+                cat_note = AccountProblem(
+                    "The line doesn't name an account and there's no default "
+                    "set, so pick the one this belongs to.",
+                    "Not matched - choose it")
+
+        review: List[str] = []
+        if party_why:
+            review.append(f'no party on this line - {party_why}')
+        if statement_is_transfer(r.description):
+            # The one reading that is quietly wrong rather than obviously
+            # wrong: money moved between two accounts this company already
+            # owns, posted as income or expense, invents a number that never
+            # happened - and the row looks like any other deposit while it
+            # does it.
+            review.append('looks like a transfer between your own accounts, '
+                          'not income or expense - check the other side')
+
+        dup = next((v for v in existing
+                    if abs(float(v.get('amount') or 0) - r.amount) < 0.005
+                    and v.get('entry_type') == r.entry_type
+                    and v.get('at_status') != '0'), None)
+        if dup:
+            review.append(f"{dup['voucher_number']} is already posted for "
+                          f"${r.amount:,.2f} on this date - this may be it again")
+
+        review = _collect_review_items(
+            r.entry_type, party_match_type, party_score,
+            bank_res.match_type, bank_res.score,
+            category_matched, False, base=review)
+
+        # A date, not a datetime: _draft_payload isoformats this straight into
+        # the draft, and a datetime would put "2025-08-01T00:00:00" where every
+        # other path puts "2025-08-01".
+        trans_date = datetime.strptime(r.date, '%Y-%m-%d').date()
+        # The source line is kept verbatim: it is what the operator checks the
+        # draft against, and the only thing that ties a voucher back to the
+        # statement it came from.
+        source = f"{r.date}  {r.description}  {r.amount:,.2f}"
+
+        payload = self._draft_payload(
+            msg=source, entry_type=r.entry_type, amount=r.amount,
+            trans_date=trans_date, party_code=party_code,
+            party_display=party_display or '(no name on the line)',
+            party_type=party_type, party_match_type=party_match_type,
+            party_score=party_score, bank_res=bank_res, cat_res=cat_res,
+            category_matched=category_matched, cheque_no=None,
+            description=r.description[:200], review_items=review,
+            extraction_source='statement', cat_note=cat_note)
+
+        d = payload['draft']
+        d['draft_id'] = f"stmt-{index}"
+        d['statement_line'] = r.line_no
+        d['statement_section'] = r.section
+        d['statement_text'] = r.description
+        d['statement_file'] = filename
+        d['duplicate_of'] = dup['voucher_number'] if dup else None
+        # An unnamed party is a field to fill, not a name to post. Clearing it
+        # here stops the commit creating a profile called "(no name on the
+        # line)" if someone saves the row without looking.
+        if not party_name:
+            d['party_name'] = None
+            d['party_is_new'] = False
+        return d
+
+    def _statement_reply(self, drafts: List[Dict], skipped: List[Dict], *,
+                         bank_res, parsed: Dict, filename: str) -> Dict:
+        crv = [d for d in drafts if d['entry_type'] == 'CRV']
+        cpv = [d for d in drafts if d['entry_type'] == 'CPV']
+        money_in = sum(d['amount'] for d in crv)
+        money_out = sum(d['amount'] for d in cpv)
+        needs = [d for d in drafts if not d.get('category_acc_code')
+                 or not d.get('party_code') and not d.get('party_name')]
+        dups = [d for d in drafts if d.get('duplicate_of')]
+        new_parties = sorted({d['party_name'] for d in drafts
+                              if d.get('party_is_new') and d.get('party_name')})
+
+        dates = sorted({d['transaction_date'] for d in drafts})
+        span = (f"{_pretty_date(dates[0])}"
+                + (f" to {_pretty_date(dates[-1])}" if dates[-1] != dates[0] else ''))
+
+        lines = [
+            f"{len(drafts)} transactions read from {filename or 'the statement'} "
+            f"({span}), through {bank_res.qualified}. "
+            f"Nothing has been written.",
+            "",
+            f"  {len(crv)} received   ${money_in:,.2f}",
+            f"  {len(cpv)} paid       ${money_out:,.2f}",
+        ]
+        if new_parties:
+            lines += ["", f"{len(new_parties)} name{'' if len(new_parties) == 1 else 's'} "
+                          f"aren't in your ledger yet; each one gets a profile "
+                          f"when you save that row."]
+        if needs:
+            lines += ["", f"{len(needs)} row{'' if len(needs) == 1 else 's'} still "
+                          f"need an account picking."]
+        if dups:
+            lines += ["", f"{len(dups)} row{'' if len(dups) == 1 else 's'} match a "
+                          f"voucher already posted on the same day - flagged, not skipped."]
+        if skipped:
+            lines += ["", f"{len(skipped)} line{'' if len(skipped) == 1 else 's'} "
+                          f"couldn't be read; they're listed at the end."]
+        lines += ["", "They come one at a time. Read each, correct what needs "
+                      "correcting, and save it - or skip it."]
+        text = strip_emojis("\n".join(lines))
+
+        return {
+            'status': 'draft',
+            'action': 'draft_queue',
+            'message': text,
+            'analysis': text,
+            'confidence': 'medium',
+            'drafts': drafts,
+            'skipped': skipped,
+            'draft': drafts[0],
+            'card': {
+                'kind': 'statement_summary',
+                'filename': filename,
+                'bank_account': bank_res.qualified,
+                'bank_acc_code': bank_res.code,
+                'account_hint': parsed.get('account_hint'),
+                'layout': parsed.get('layout'),
+                'date_from': dates[0], 'date_to': dates[-1],
+                'count': len(drafts),
+                'crv_count': len(crv), 'cpv_count': len(cpv),
+                'money_in': money_in, 'money_out': money_out,
+                'needs_account': len(needs),
+                'duplicates': len(dups),
+                'new_parties': new_parties,
+                'skipped': skipped,
+            },
+        }
+
     def _draft_payload(self, *, msg, entry_type, amount, trans_date, party_code,
                        party_display, party_type, party_match_type, party_score,
                        bank_res, cat_res, category_matched, cheque_no,
@@ -4620,11 +5425,15 @@ Return ONLY valid JSON, no markdown, no extra text.
         description = extracted.get('description') or (
             'Receipt Voucher' if entry_type == 'CRV' else 'Payment Voucher')
 
-        if not entry_type or not amount or not party_name:
+        # `not amount` was catching 0.0 as well as None, so a line that DID
+        # name an amount - "Paid $0.00 to ..." - was reported as "missing the
+        # amount". It wasn't missing, it was zero, and the dedicated message
+        # for that a few lines below could never be reached.
+        if not entry_type or amount is None or not party_name:
             missing = []
             if not entry_type:
                 missing.append('whether this is money received or paid')
-            if not amount:
+            if amount is None:
                 missing.append('the amount')
             if not party_name:
                 missing.append('the customer/vendor name')
@@ -5944,6 +6753,132 @@ async def api_commit_voucher(payload: VoucherCommit):
         return {"status": "error", "message": t, "analysis": t, "confidence": "low"}
     finally:
         if own:
+            conn.close()
+
+
+# --------------------------------------------------------------------------
+# Getting text out of an uploaded statement.
+#
+# Three readers, tried in order, because the one that is installed varies by
+# machine and a missing library should degrade to a worse layout rather than
+# to a failure. Layout mode matters more than it looks: the section heading a
+# row sits under is the only thing that says which way the money went, and a
+# reader that reflows the page loses it.
+# --------------------------------------------------------------------------
+STATEMENT_MAX_BYTES = int(os.getenv("STATEMENT_MAX_BYTES", str(15 * 1024 * 1024)))
+
+
+def _pdf_text(data: bytes) -> Tuple[str, str]:
+    """(text, which reader produced it)."""
+    errors = []
+
+    try:
+        import pdfplumber, io
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            pages = [p.extract_text(layout=True) or '' for p in pdf.pages]
+        text = "\n".join(pages)
+        if text.strip():
+            return text, 'pdfplumber'
+        errors.append("pdfplumber found no text")
+    except Exception as e:
+        errors.append(f"pdfplumber: {e}")
+
+    try:
+        import subprocess, tempfile
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as fh:
+            fh.write(data)
+            fh.flush()
+            out = subprocess.run(['pdftotext', '-layout', fh.name, '-'],
+                                 capture_output=True, timeout=60)
+        text = out.stdout.decode('utf-8', 'replace')
+        if text.strip():
+            return text, 'pdftotext'
+        errors.append("pdftotext found no text")
+    except Exception as e:
+        errors.append(f"pdftotext: {e}")
+
+    try:
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(data))
+        text = "\n".join((p.extract_text() or '') for p in reader.pages)
+        if text.strip():
+            return text, 'pypdf'
+        errors.append("pypdf found no text")
+    except Exception as e:
+        errors.append(f"pypdf: {e}")
+
+    raise ValueError(
+        "I couldn't get any text out of that PDF. "
+        + ("It's most likely a scan or a photo rather than a statement "
+           "downloaded from the bank - there are no words in the file to "
+           "read, only an image of them. Download the PDF or CSV from your "
+           "bank's site and upload that instead."
+           if any('no text' in e for e in errors) else
+           "No PDF reader is installed on the server: run "
+           "`pip install pdfplumber` and restart.")
+    )
+
+
+def statement_text_from_upload(filename: str, data: bytes) -> Tuple[str, str]:
+    name = (filename or '').lower()
+    if name.endswith('.pdf') or data[:5] == b'%PDF-':
+        return _pdf_text(data)
+    for enc in ('utf-8', 'utf-8-sig', 'latin-1'):
+        try:
+            return data.decode(enc), 'text'
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("I can read a PDF, or a plain text or CSV export. "
+                     "That file is neither.")
+
+
+@app.post("/api/statement/preview")
+async def api_statement_preview(file: UploadFile = File(...),
+                                session_id: Optional[str] = Form(None),
+                                bank_account: Optional[str] = Form(None)):
+    """
+    A statement, read into drafts. THIS ENDPOINT NEVER WRITES.
+
+    It is the upload half of preview=true: the rows are resolved here, and
+    each one is saved separately through /api/commit afterwards, by code,
+    once a person has looked at it. There is deliberately no
+    /api/statement/commit - a file should not be able to post sixty vouchers
+    because someone clicked once.
+    """
+    own = session_id is None
+    conn = None
+    try:
+        data = await file.read()
+        if not data:
+            raise ValueError("That file came through empty.")
+        if len(data) > STATEMENT_MAX_BYTES:
+            raise ValueError(
+                f"That file is {len(data) / 1048576:.1f} MB, over the "
+                f"{STATEMENT_MAX_BYTES / 1048576:.0f} MB limit. A statement "
+                f"PDF is normally well under a megabyte - if yours is large "
+                f"it is probably a scan, which has no text to read.")
+
+        text, reader = statement_text_from_upload(file.filename or '', data)
+        parsed = parse_statement_text(text)
+        print(f"STATEMENT: {file.filename!r} via {reader} -> "
+              f"{len(parsed['rows'])} rows, {len(parsed['unreadable'])} unreadable, "
+              f"layout={parsed['layout']}, acct={parsed['account_hint']}")
+
+        conn = get_connection() if own else bot.get_session_db(session_id)
+        out = await bot.handle_statement_import(
+            conn, parsed, filename=file.filename or 'statement',
+            bank_text=bank_account)
+        out.pop('_final', None)
+        return out
+    except ValueError as e:
+        t = str(e)
+        return {"status": "error", "message": t, "analysis": t, "confidence": "low"}
+    except Exception as e:
+        t = _internal_error_message(e, "reading that statement")
+        return {"status": "error", "message": t, "analysis": t, "confidence": "low"}
+    finally:
+        if own and conn is not None:
             conn.close()
 
 
