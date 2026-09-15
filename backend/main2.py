@@ -1116,6 +1116,10 @@ _UPD_FIELD_MAP = {
     'date': 'transaction_date', 'dated': 'transaction_date',
     'party': 'party', 'customer': 'party', 'vendor': 'party',
     'payee': 'party', 'supplier': 'party', 'client': 'party',
+    # "change name to X" is how people say it. Safe as a keyword because a
+    # value is always consumed before the next keyword is looked for, so the
+    # "name" inside "note the name is wrong" is never seen as a field.
+    'name': 'party', 'payer': 'party', 'recipient': 'party',
     'bank': 'bank', 'cash': 'bank', 'contra': 'bank', 'source': 'bank',
     'category': 'category', 'classification': 'category', 'account': 'category',
     'expense': 'category', 'income': 'category', 'revenue': 'category', 'head': 'category',
@@ -1124,9 +1128,17 @@ _UPD_FIELD_MAP = {
     'desc': 'description', 'memo': 'description', 'remark': 'description',
     'remarks': 'description', 'narration': 'description',
 }
+# People name the field the way they'd say it out loud: "change bank NAME to
+# UBL 1234", "set cheque NUMBER to 4521". The noun after the keyword is part of
+# the label, not the value - but only when a connector follows it, or "note
+# number of items" would lose its first word. Longest alternative first, so the
+# filler form is tried before the plain one.
 _UPD_FIELD_RE = re.compile(
     r'\b(' + '|'.join(sorted(_UPD_FIELD_MAP, key=len, reverse=True)) + r')\b'
-    r'\s*(?:to|as|=|:)?\s*', re.IGNORECASE)
+    r'(?:'
+    r'\s+(?:name|no\.?|number|account|acct|field|value|head)\s*(?:to|as|into|=|:)\s*'
+    r'|\s*(?:to|as|into|=|:)?\s*'
+    r')', re.IGNORECASE)
 
 # Short fields whose value ends at its own natural boundary. Anything after it
 # is a fresh field, comma or no comma. Long fields (party / bank / category /
@@ -1144,23 +1156,16 @@ _UPD_SHORT_VALUE = {
 _SEGMENT_END_RE = re.compile(r'[,;\n]')
 
 
-def _parse_update_command(msg: str) -> Optional[Dict[str, Any]]:
+def _scan_update_fields(rest: str) -> Dict[str, str]:
     """
-    'update 260902000001 amount 500, category Printing, date 06/10/2026'
-    Returns {"at_id": ..., "fields": {...}} or None.
+    'amount 500, category Printing, date 06/10/2026' -> {...}
 
     Scans left to right and consumes each value before looking for the next
     keyword, so a keyword sitting inside a value is never mistaken for a new
-    field.
+    field. Shared by the single-voucher edit and the bulk one - the grammar
+    after the target is identical, and having two copies of it was how they
+    drifted apart before.
     """
-    m = _UPDATE_CMD_RE.match(msg or '')
-    if not m:
-        return None
-    at_id = m.group('id')
-    rest = (m.group('rest') or '').strip(' ,;:-')
-    if not rest:
-        return {"at_id": at_id, "fields": {}}
-
     fields: Dict[str, str] = {}
     pos = 0
     while pos < len(rest):
@@ -1180,10 +1185,84 @@ def _parse_update_command(msg: str) -> Optional[Dict[str, Any]]:
         val = val.strip().strip(' ,;')
         if val and key not in fields:
             fields[key] = val
+    return fields
 
+
+def _parse_update_command(msg: str) -> Optional[Dict[str, Any]]:
+    """
+    'update 260902000001 amount 500, category Printing, date 06/10/2026'
+    Returns {"at_id": ..., "fields": {...}} or None.
+    """
+    m = _UPDATE_CMD_RE.match(msg or '')
+    if not m:
+        return None
+    at_id = m.group('id')
+    rest = (m.group('rest') or '').strip(' ,;:-')
+    if not rest:
+        return {"at_id": at_id, "fields": {}}
+    fields = _scan_update_fields(rest)
     if not fields:
         return {"at_id": at_id, "fields": {}, "unparsed_tail": rest}
     return {"at_id": at_id, "fields": fields}
+
+
+# --------------------------------------------------------------------------
+# Editing a whole day at once
+#
+# "2026-09-04 change name to 3S for all" named a DATE where the edit grammar
+# wanted an id, so it matched nothing and fell through to the voucher parser,
+# which reported a missing amount. The tick-list could already do this; there
+# was just no way to say it in one line.
+#
+# Both shapes need an explicit bulk marker - a leading date, or the word
+# "vouchers"/"all" - because "Paid 450 to X on 2026-09-04" is a posting, and
+# must never be read as an instruction to rewrite that day.
+# --------------------------------------------------------------------------
+_BULK_TAIL = (r'(?:\s+(?:for|to|across|on)\s+(?:all|every|each|the\s+rest)'
+              r'(?:\s+of\s+(?:them|these|those))?'
+              r'(?:\s+(?:vouchers?|entries|entry|transactions?))?)\s*$')
+
+_BULK_LEAD_DATE_RE = re.compile(
+    r'^\s*(?P<date>' + _DATE_TOKEN + r')\s*[,:;\-]?\s*'
+    r'(?:update|edit|change|modify|amend|correct|fix|set)\s+'
+    r'(?P<rest>.+?)$', re.IGNORECASE | re.DOTALL)
+
+_BULK_TAIL_DATE_RE = re.compile(
+    r'^\s*(?:update|edit|change|modify|amend|correct|fix|set|bulk\s+edit)\s+'
+    r'(?P<rest>.+?)\s+'
+    r'(?:for|on|in|across)\s+(?:all\s+|every\s+|the\s+)*'
+    r'(?:vouchers?|entries|entry|transactions?)\s*'
+    r'(?:posted|dated|created|made)?\s*(?:on|for|of|from|dated)?\s*'
+    r'(?P<date>' + _DATE_TOKEN + r')\s*$', re.IGNORECASE)
+
+_BULK_TAIL_RE = re.compile(_BULK_TAIL, re.IGNORECASE)
+
+
+def _parse_bulk_update_command(msg: str) -> Optional[Dict[str, Any]]:
+    """
+    'change name to 3S for vouchers posted on 2026-09-04'
+    '2026-09-04 change name to 3S for all'
+    -> {"date": "2026-09-04", "fields": {...}} or None.
+    """
+    msg = (msg or '').strip()
+    for rx in (_BULK_TAIL_DATE_RE, _BULK_LEAD_DATE_RE):
+        m = rx.match(msg)
+        if not m:
+            continue
+        iso = parse_date_text(m.group('date'))
+        if not iso:
+            continue
+        rest = (m.group('rest') or '').strip(' ,;:-')
+        # A trailing "for all" belongs to the sentence, not to the last value:
+        # without this, "name to 3S for all" sets the party to "3S for all".
+        rest = _BULK_TAIL_RE.sub('', rest).strip(' ,;:-')
+        if not rest:
+            return None
+        fields = _scan_update_fields(rest)
+        if not fields:
+            return {"date": iso, "fields": {}, "unparsed_tail": rest}
+        return {"date": iso, "fields": fields}
+    return None
 
 
 _PROFILE_KIND_MAP = {
@@ -1208,7 +1287,9 @@ _PROFILE_FIELD_MAP = {
     'title': 'job_title', 'job': 'job_title', 'role': 'job_title', 'position': 'job_title',
     'account': 'p_account', 'gl': 'p_account', 'gl account': 'p_account',
     'contact': 'person_name', 'person': 'person_name', 'attn': 'person_name',
-    'company': 'company_name',
+    # "name" is what people call it. It was missing entirely, so renaming a
+    # profile - the commonest edit there is - had no word for it.
+    'company': 'company_name', 'name': 'company_name',
     'note': 'other_desc', 'notes': 'other_desc', 'memo': 'other_desc', 'about': 'business_desc',
 }
 _PROFILE_FIELD_RE = re.compile(
@@ -1220,6 +1301,44 @@ _PROFILE_FIELD_RE = re.compile(
 _PROFILE_INLINE_RE = re.compile(
     r'\b(e-?mail|mail|phone|tel|telephone|mobile|cell)\b\s*(?:is|=|:)?\s*',
     re.IGNORECASE)
+
+# Where the fields start inside a line with no commas at all:
+#     update customer Example456 name to Example567 phone number to 000111
+# Unanchored, unlike _PROFILE_FIELD_RE, and it REQUIRES a connector after the
+# keyword. That requirement is what keeps a company called "State Farm" or
+# "Companies House" intact - a field word only counts as a field word when it
+# is followed by "to"/"is"/":", which a name never is. The optional noun
+# between ("phone NUMBER to") belongs to the label, not the value.
+_PROFILE_FIELD_FIND_RE = re.compile(
+    r'\b(' + '|'.join(sorted(_PROFILE_FIELD_MAP, key=len, reverse=True)) + r')\b'
+    r'(?:\s+(?:number|no\.?|id|line|address))?'
+    r'\s*(?:to|is|=|:)\s+', re.IGNORECASE)
+
+
+def _scan_profile_fields(tail: str) -> Tuple[Dict[str, str], List[str]]:
+    """
+    'name to Example567 phone number to 000111' -> {company_name, phone}
+
+    Left to right, each value running to the next field keyword - the same
+    shape as the voucher field scanner, for the same reason: a value may
+    legitimately contain a word that is also a field name.
+    """
+    fields: Dict[str, str] = {}
+    unparsed: List[str] = []
+    marks = list(_PROFILE_FIELD_FIND_RE.finditer(tail or ''))
+    if not marks:
+        return fields, unparsed
+    if marks[0].start() > 0:
+        lead = tail[:marks[0].start()].strip(' ,;:-')
+        if lead:
+            unparsed.append(lead)
+    for i, m in enumerate(marks):
+        key = _PROFILE_FIELD_MAP[re.sub(r'\s+', ' ', m.group(1).lower())]
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(tail)
+        val = tail[m.end():end].strip().strip(' ,;')
+        if val and key not in fields:
+            fields[key] = val
+    return fields, unparsed
 
 
 # The same instruction, said the way people say it:
@@ -1354,7 +1473,13 @@ def _parse_edit_profile_command(msg: str) -> Optional[Dict[str, Any]]:
         # "ABC Trading, phone 555-…" - the name is whatever precedes the first
         # comma, same rule the create command uses.
         head, _, after = rest.partition(',')
-        fm = _PROFILE_FIELD_RE.search(head)
+        # ...but people don't always use the comma. Find where the fields
+        # actually begin instead. (The previous attempt at this searched with
+        # an anchored pattern, so it could only ever match at position 0 and
+        # the branch never ran - an edit without a comma or an apostrophe
+        # fell through to the voucher parser, which read the phone number as
+        # a dollar amount.)
+        fm = _PROFILE_FIELD_FIND_RE.search(head)
         if fm and fm.start() > 0:
             name, tail = head[:fm.start()].strip(), (
                 head[fm.start():] + (',' + after if after else '')).strip()
@@ -1370,6 +1495,15 @@ def _parse_edit_profile_command(msg: str) -> Optional[Dict[str, Any]]:
     fields: Dict[str, str] = {}
     unparsed: List[str] = []
     for seg in [x.strip() for x in re.split(r'[,;\n]', tail) if x.strip()]:
+        # A comma is still a separator; this only splits WITHIN a segment, so
+        # "name to X phone to Y" yields two fields while
+        # "address to 12 Main St, city Austin" keeps its comma meaning.
+        many, lead = _scan_profile_fields(seg)
+        if len(many) > 1:
+            for k, v in many.items():
+                fields.setdefault(k, v)
+            unparsed += lead
+            continue
         # "phone to 555-…" reads naturally and means the same as "phone 555-…"
         seg = re.sub(r'\bto\s+', '', seg, count=1) if re.match(
             r'^\s*[a-z ]+\s+to\s+', seg, re.IGNORECASE) else seg
@@ -2389,6 +2523,12 @@ def _draft_quality(payload: Dict[str, Any]) -> int:
     """How much of a draft actually resolved. Used to decide whether a rewrite
     was an improvement or just a different guess."""
     d = (payload or {}).get('draft') or {}
+    if d.get('kind') == 'edit':
+        # Every field on an edit draft is already populated from the stored
+        # voucher, so counting filled codes says nothing at all - it is 3 out
+        # of 3 whether or not we understood a word of the request. What varies
+        # is how many CHANGES were understood.
+        return len(d.get('applied') or [])
     return sum(1 for k in ('bank_acc_code', 'category_acc_code', 'party_code')
                if d.get(k))
 
@@ -3071,7 +3211,8 @@ class AccountingBot:
         # The model name doesn't depend on whether a key was found - keeping it
         # unconditional means anything that reads self.model (the voice pass,
         # /api/debug/extract) works the same however the client got attached.
-        self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        # self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         if api_key:
             self.groq_client = Groq(api_key=api_key)
             print(f"Groq client initialized ({self.model})")
@@ -3467,7 +3608,7 @@ Return ONLY valid JSON, no markdown, no extra text.
             # exact file:line instead of a bare exception name.
             traceback.print_exc()
             return self._reply(_internal_error_message(e, "adding that account"),
-                               'error')
+                               'error', _final=True)
 
         return self._account_created_reply(r, level, parent_code, parent_label)
 
@@ -3555,7 +3696,8 @@ Return ONLY valid JSON, no markdown, no extra text.
                     f"companies share, and the name is stored once for all of "
                     f"them — renaming it here would rename it for every one.\n\n"
                     f"Add your own account instead:\n"
-                    f"  add account {parsed['new_name']} under <heading>", 'error')
+                    f"  add account {parsed['new_name']} under <heading>",
+                    'error', _final=True)
 
         if preview:
             return self._chart_edit_draft(conn, code=code, label=label, op=op,
@@ -3569,7 +3711,7 @@ Return ONLY valid JSON, no markdown, no extra text.
             return self._reply(str(e), 'error')
         except Exception as e:
             return self._reply(_internal_error_message(e, "changing that account"),
-                               'error')
+                               'error', _final=True)
         return self._reply(r['message'], action='account_updated', card={
             "kind": "account", "code": r['code'], "name": r.get('name'),
             "level": account_level(r['code']), "updated": True,
@@ -3653,6 +3795,11 @@ Return ONLY valid JSON, no markdown, no extra text.
                 r['message'] = (f"I couldn't see a field name in \"{tail}\" — "
                                 f"opened it for editing instead.\n\n") + r['message']
                 r['analysis'] = r['message']
+                # Same wording miss as a value that wouldn't resolve, and the
+                # commoner one: "chnge teh bnk to bofa" has no field name the
+                # rules recognise. Opening the voucher untouched is a fine
+                # fallback, but the model deserves a look first.
+                r['_field_error'] = True
             return r
 
         current = fetch_voucher(conn, at_id)
@@ -3663,13 +3810,19 @@ Return ONLY valid JSON, no markdown, no extra text.
                 f"{current['voucher_number']} can't be edited — it is "
                 + "; ".join(current['blockers']) + ".\n\n"
                 f"Void it and post a fresh one:\n    void {at_id}",
-                'error', card=self._voucher_card(current))
+                'error', card=self._voucher_card(current), _final=True)
 
         entry_type = current['entry_type']
         upd, applied, resolved_notes, err = _resolve_update_fields(
             conn, entry_type, fields)
         if err:
-            return self._reply(err, 'error')
+            # A field value that didn't resolve is a WORDING miss, not a state
+            # one - the voucher exists and is editable, we just couldn't read
+            # what they wanted it changed to. The caller may retry it through
+            # the model; "not found" and "not editable" never should be.
+            r = self._reply(err, 'error')
+            r['_field_error'] = True
+            return r
 
         # ---- Stop here when the client asked for a draft ----
         # Every change has been resolved to a code; nothing is written.
@@ -3683,7 +3836,7 @@ Return ONLY valid JSON, no markdown, no extra text.
         except ValueError as e:
             return self._reply(str(e), 'error')
         except Exception as e:
-            return self._reply(_internal_error_message(e, "saving that change"), 'error')
+            return self._reply(_internal_error_message(e, "saving that change"), 'error', _final=True)
 
         text = out.get('message', f"Updated {at_id}.")
         if resolved_notes:
@@ -3707,13 +3860,13 @@ Return ONLY valid JSON, no markdown, no extra text.
                 return self._reply(
                     f"{current['voucher_number']} is already void - "
                     f"nothing to do.", 'error',
-                    card=self._voucher_card(current))
+                    card=self._voucher_card(current), _final=True)
             if current['reconciled_legs']:
                 return self._reply(
                     f"{current['voucher_number']} has been bank-reconciled, so "
                     f"voiding it here would break the reconciliation. "
                     f"Unreconcile it in LockInLedger first, then void it.",
-                    'error')
+                    'error', _final=True)
 
             note = (f"This reverses {current['voucher_number']} - "
                     f"${float(current['amount'] or 0):,.2f} "
@@ -3770,7 +3923,7 @@ Return ONLY valid JSON, no markdown, no extra text.
         except ValueError as e:
             return self._reply(str(e), 'error')
         except Exception as e:
-            return self._reply(_internal_error_message(e, "saving that profile"), 'error')
+            return self._reply(_internal_error_message(e, "saving that profile"), 'error', _final=True)
         return self._reply(out['message'], action='profile', card={
             "kind": "profile", "created": False, "updated": True,
             "p_code": out['p_code'], "p_type": out['p_type'],
@@ -3849,7 +4002,7 @@ Return ONLY valid JSON, no markdown, no extra text.
         except ValueError as e:
             return self._reply(str(e), 'error')
         except Exception as e:
-            return self._reply(_internal_error_message(e, "creating that profile"), 'error')
+            return self._reply(_internal_error_message(e, "creating that profile"), 'error', _final=True)
 
         return self._profile_created_reply(conn, r, payload, p_type, unparsed)
 
@@ -4037,6 +4190,86 @@ Return ONLY valid JSON, no markdown, no extra text.
                 'review_note': '; '.join(draft['review_items']) or None,
                 'card': {**draft, 'kind': 'draft', 'draft_kind': 'edit'}}
 
+    async def handle_bulk_update(self, conn, date_iso: str, fields: Dict[str, str],
+                                 tail: Optional[str] = None,
+                                 preview: bool = False, msg: str = '') -> Dict:
+        """
+        One change, every voucher on a day - opened as a QUEUE of drafts.
+
+        "Bulk" here means the typing is bulk, not the writing. Each voucher
+        still comes back resolved-but-unwritten and is confirmed on its own,
+        because a single misread word would otherwise rewrite a whole day of
+        the ledger in one keystroke. This is the same machinery the tick-list
+        already used; all that was missing was a way to say it in a sentence.
+        """
+        pretty = date_iso
+        try:
+            pretty = datetime.strptime(date_iso, '%Y-%m-%d').strftime('%m/%d/%Y')
+        except Exception:
+            pass
+
+        if not fields:
+            t = (f"I couldn't see a field name in \"{tail or msg}\".\n\n"
+                 f"Name what to change, then the day:\n"
+                 f"  change party to 3S for all vouchers on {date_iso}\n\n"
+                 f"Fields: amount, date, party, bank, category, check, note.")
+            return self._reply(t, 'error')
+
+        rows = list_vouchers(conn, limit=200, on_date=date_iso)
+        if not rows:
+            return self._reply(
+                f"There are no vouchers dated {pretty}, so there is nothing to "
+                f"change.", 'error', _final=True)
+
+        drafts, skipped = [], []
+        for row in rows:
+            at_id = str(row.get('at_id'))
+            current = fetch_voucher(conn, at_id)
+            if not current.get('found'):
+                skipped.append((at_id, current.get('error', 'not found')))
+                continue
+            if not current.get('editable'):
+                skipped.append((current['voucher_number'],
+                                '; '.join(current['blockers'])))
+                continue
+            upd, applied, notes, err = _resolve_update_fields(
+                conn, current['entry_type'], fields)
+            if err:
+                # The same value can be valid for one voucher and not another -
+                # an income account on a CRV is not one on a CPV - so a failure
+                # here skips that voucher rather than sinking the whole day.
+                skipped.append((current['voucher_number'], err.splitlines()[0]))
+                continue
+            d = self._edit_draft_payload(conn, current, upd=upd, applied=applied,
+                                         notes=notes, msg=msg)
+            drafts.append(d['draft'])
+
+        if not drafts:
+            lines = [f"Nothing on {pretty} could take that change."]
+            if skipped:
+                lines += [""] + [f"  {n} - {why}" for n, why in skipped[:8]]
+            return self._reply("\n".join(lines), 'error',
+                               _final=not any('match' in w for _, w in skipped))
+
+        what = ', '.join(sorted(fields))
+        lines = [f"{len(drafts)} voucher{'' if len(drafts) == 1 else 's'} on "
+                 f"{pretty} ready to change ({what}). Nothing has been written."]
+        if skipped:
+            lines += ["", f"Skipped {len(skipped)}:"]
+            lines += [f"  {n} - {why}" for n, why in skipped[:8]]
+            if len(skipped) > 8:
+                lines.append(f"  ...and {len(skipped) - 8} more")
+        lines += ["", "Step through them in the panel - each one saves on its own."]
+
+        return {'status': 'draft', 'action': 'draft_queue',
+                'message': strip_emojis("\n".join(lines)),
+                'analysis': strip_emojis("\n".join(lines)),
+                'confidence': 'high',
+                'draft': drafts[0], 'drafts': drafts,
+                'skipped': [{'voucher': n, 'reason': w} for n, w in skipped],
+                'review_items': drafts[0].get('review_items') or [],
+                'card': {**drafts[0], 'kind': 'draft', 'draft_kind': 'edit'}}
+
     async def handle_voucher_list(self, conn, date_iso: str) -> Dict:
         """A day's vouchers, to pick from for a bulk edit."""
         rows = list_vouchers(conn, limit=200, on_date=date_iso)
@@ -4161,10 +4394,103 @@ Return ONLY valid JSON, no markdown, no extra text.
             'card': {**draft, 'kind': 'draft', 'draft_kind': draft['kind']},
         }
 
+    # ----------------------------------------------------------------------
+    # Asking the model is the DEFAULT, not something each branch opts into.
+    #
+    # It was the other way round, and it kept going wrong the same way: a new
+    # refusal path would ship with no hook, and nothing announced the gap - the
+    # reply looked like a considered "no" rather than a "no" from a reader that
+    # never got asked. Three separate paths had to be patched by hand before
+    # the pattern was obvious.
+    #
+    # So the deterministic pipeline (_process_once) now knows nothing about the
+    # model, and this wrapper decides afterwards, from the RESULT alone,
+    # whether the run is worth a second attempt. A path that refuses for a
+    # reason wording cannot fix marks itself final; everything else is
+    # retryable without having to know this exists.
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _worth_a_rewrite(out: Dict) -> bool:
+        """Is this outcome a 'couldn't read it', or a real answer?"""
+        if not isinstance(out, dict) or out.get('_final'):
+            return False
+        if out.get('status') == 'error':
+            return True
+        # A voucher draft missing a leg is a failure that doesn't look like
+        # one: the message parsed, it just parsed into nonsense.
+        d = out.get('draft') if isinstance(out.get('draft'), dict) else None
+        if d and d.get('kind') == 'voucher':
+            return not (d.get('bank_acc_code') and d.get('category_acc_code'))
+        # An edit that opened untouched because no field name was recognised.
+        return bool(out.pop('_field_error', False))
+
+    @staticmethod
+    def _rewrite_is_better(alt: Dict, first: Dict) -> bool:
+        """Keep a rewrite only when it resolved strictly more than we had."""
+        if not isinstance(alt, dict) or alt.get('status') == 'error':
+            return False
+        if first.get('status') == 'error':
+            return True
+        return _draft_quality(alt) > _draft_quality(first)
+
     async def process_message(self, message: str, session_id: str,
                               mode: Optional[str] = None,
                               preview: bool = False,
                               _rewritten: bool = False) -> Dict:
+        first = await self._process_once(message, session_id, mode, preview,
+                                         _rewritten)
+        if _rewritten or not self._worth_a_rewrite(first) or not _llm_available():
+            first.pop('_final', None)
+            return first
+
+        rewritten = _llm_canonical_command(message, mode)
+        if not rewritten:
+            first.pop('_final', None)
+            return first
+
+        # A destructive command is never RUN from a reading of a sentence. If
+        # the model thinks that is what was meant, it comes back as a line to
+        # send, so the decision stays with the person.
+        if _VOID_CMD_RE.match(rewritten) and not _VOID_CMD_RE.match(message or ''):
+            t = ("I think you meant to cancel a voucher. I won't do that from "
+                 "a guess, so here it is to send if it's right:")
+            return {'status': 'error', 'message': t, 'analysis': t,
+                    'confidence': 'low', 'suggestions': [rewritten]}
+
+        # An edit may only be restated, never redirected: if the original named
+        # a voucher, the rewrite has to name the same one.
+        m0 = _UPDATE_CMD_RE.match(message or '') or _SHOW_CMD_RE.match(message or '')
+        if m0:
+            m1 = _UPDATE_CMD_RE.match(rewritten) or _SHOW_CMD_RE.match(rewritten)
+            if not m1 or m1.group('id') != m0.group('id'):
+                print(f"NOTE: LLM rewrite changed the voucher, discarded: "
+                      f"{rewritten!r}")
+                first.pop('_final', None)
+                return first
+
+        print(f"NOTE: LLM rewrote {(message or '')[:60]!r} -> {rewritten!r}")
+        alt = await self._process_once(rewritten, session_id, mode, preview,
+                                       _rewritten=True)
+        if not self._rewrite_is_better(alt, first):
+            first.pop('_final', None)
+            return first
+
+        items = list(alt.get('review_items') or [])
+        items.append(f'wording (I read your line as "{rewritten}")')
+        alt['review_items'] = items
+        alt['rewritten_from'] = message
+        alt['rewritten_to'] = rewritten
+        if isinstance(alt.get('draft'), dict):
+            alt['draft']['review_items'] = items
+            alt['draft']['source_message'] = message
+        alt.pop('_final', None)
+        return alt
+
+    async def _process_once(self, message: str, session_id: str,
+                            mode: Optional[str] = None,
+                            preview: bool = False,
+                            _rewritten: bool = False) -> Dict:
+        """One deterministic pass. Knows nothing about the language model."""
         conn = self.get_session_db(session_id)
         msg = (message or "").strip()
 
@@ -4181,6 +4507,16 @@ Return ONLY valid JSON, no markdown, no extra text.
             mep = _parse_edit_profile_command(msg)
             if mep and not _UPDATE_CMD_RE.match(msg):
                 return await self.handle_edit_profile(conn, mep, preview, msg)
+
+            # A whole day, before the single-voucher form: that one needs an
+            # id, and a date is not an id, so this would otherwise fall all
+            # the way through to the voucher parser and be reported as a
+            # posting with no amount.
+            mb = _parse_bulk_update_command(msg)
+            if mb:
+                return await self.handle_bulk_update(
+                    conn, mb['date'], mb['fields'], mb.get('unparsed_tail'),
+                    preview, msg)
 
             mu = _UPDATE_CMD_RE.match(msg)
             if mu:
@@ -4254,34 +4590,6 @@ Return ONLY valid JSON, no markdown, no extra text.
             return {'status': 'error', 'message': t, 'analysis': t,
                     'confidence': 'low', 'extraction_source': extracted.get('_source')}
         if action == 'unparsed':
-            # Last resort before refusing: let the model rewrite the message as
-            # a command in our own grammar, then run the whole deterministic
-            # pipeline again on THAT. Once only - a rewrite that still fails is
-            # a rewrite that was wrong.
-            if not _rewritten:
-                rewritten = _llm_canonical_command(msg, mode)
-                if rewritten:
-                    if _VOID_CMD_RE.match(rewritten):
-                        # Never void a voucher because a sentence was misread.
-                        t = (f"I think you meant to cancel a voucher. I won't do "
-                             f"that from a guess, so here it is to send if it's "
-                             f"right:")
-                        return {'status': 'error', 'message': t, 'analysis': t,
-                                'confidence': 'low', 'suggestions': [rewritten]}
-                    print(f"NOTE: LLM rewrote {msg[:60]!r} -> {rewritten!r}")
-                    out = await self.process_message(
-                        rewritten, session_id, mode, preview, _rewritten=True)
-                    if out.get('status') != 'error':
-                        out['rewritten_from'] = msg
-                        out['rewritten_to'] = rewritten
-                        items = list(out.get('review_items') or [])
-                        items.append('wording (I read your line as '
-                                     f'"{rewritten}")')
-                        out['review_items'] = items
-                        if isinstance(out.get('draft'), dict):
-                            out['draft']['review_items'] = items
-                            out['draft']['source_message'] = msg
-                        return out
             hint = _diagnose_unparsed(msg)
             # The raw exception is for the log, not for the person - they can't
             # act on a 404 from a model provider. All they need to know is that
@@ -4428,7 +4736,8 @@ Return ONLY valid JSON, no markdown, no extra text.
                      f"side of this entry to.\n\nAdd one first — for example:\n"
                      f"  add {kind} account "
                      f"{'Consulting Income' if entry_type == 'CRV' else 'Office Supplies'}")
-                return {'status': 'error', 'message': t, 'analysis': t, 'confidence': 'low'}
+                return {'status': 'error', 'message': t, 'analysis': t,
+                        'confidence': 'low', '_final': True}
 
             category_matched = cat_res is not None
             cat_note = cat_err if cat_res is None else None
@@ -4510,31 +4819,6 @@ Return ONLY valid JSON, no markdown, no extra text.
 
             # ---- The rules parsed it, but badly ----------------------------
             # A message with a direction word and a number always "parses" -
-            # "paid 450 handy fix llc repair maintanence bofa 9523" becomes a
-            # voucher whose party is the entire sentence and whose accounts are
-            # empty. That is a worse failure than not parsing at all, because
-            # nothing announces it. So a draft with unresolved legs gets the
-            # same rewrite treatment, and the rewrite is only kept if it
-            # resolves strictly MORE than the original did.
-            if preview and unresolved and not _rewritten:
-                rewritten = _llm_canonical_command(msg, mode)
-                if rewritten and not _VOID_CMD_RE.match(rewritten):
-                    alt = await self.process_message(
-                        rewritten, session_id, mode, preview, _rewritten=True)
-                    here = sum(1 for x in (bank_res, cat_res, party_code) if x)
-                    if alt.get('status') == 'draft' and _draft_quality(alt) > here:
-                        print(f"NOTE: LLM rewrite improved the parse "
-                              f"({here} -> {_draft_quality(alt)}): {rewritten!r}")
-                        items = list(alt.get('review_items') or [])
-                        items.append(f'wording (I read your line as "{rewritten}")')
-                        alt['review_items'] = items
-                        alt['rewritten_from'] = msg
-                        alt['rewritten_to'] = rewritten
-                        if isinstance(alt.get('draft'), dict):
-                            alt['draft']['review_items'] = items
-                            alt['draft']['source_message'] = msg
-                        return alt
-
             # ---- Stop here when the client asked for a draft ----
             # Nothing has been written at this point: resolve_party ran with
             # create_missing=False, and the two account legs are lookups.

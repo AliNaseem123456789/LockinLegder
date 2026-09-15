@@ -47,6 +47,9 @@ import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import HistoryIcon from '@mui/icons-material/History';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutlined';
 import LightbulbOutlinedIcon from '@mui/icons-material/LightbulbOutlined';
+import AttachFileIcon from '@mui/icons-material/AttachFile';
+import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
+import UploadFileIcon from '@mui/icons-material/UploadFile';
 import axios from 'axios';
 
 // -----------------------------------------------------------------------------
@@ -120,6 +123,18 @@ const theme = createTheme({
 // -----------------------------------------------------------------------------
 const money = (v) =>
   Number(v ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// What identifies one draft inside a queue. An edit queue keys on the voucher
+// it opened; a statement queue is rows that have no voucher yet, so the
+// server stamps each with a draft_id. Without a key, saving one row marks
+// every unsaved row as done and the queue closes after the first save.
+const draftKey = (d) => String(d?.at_id || d?.draft_id || '');
+
+// A statement arrives as a file, not a sentence — these are the ones worth
+// trying. Anything else is refused in the browser rather than uploaded and
+// rejected.
+const STATEMENT_TYPES = '.pdf,.txt,.csv,.tsv';
+const STATEMENT_MAX_MB = 15;
 
 const formatDateForDisplay = (iso) => {
   if (!iso) return '';
@@ -521,7 +536,7 @@ const ProfileCard = ({ card, onCommand, flush }) => (
     {onCommand ? (
       <Button
         size="small"
-        onClick={() => onCommand(`Paid $0.00 to ${card.company_name || card.person_name} for `, true)}
+        onClick={() => onCommand(`Paid $ to ${card.company_name || card.person_name} for `, true)}
         sx={{
           mt: 1.25, minHeight: 26, px: 1, fontSize: 12, color: C.inkMid,
           border: `1px solid ${C.line}`, borderRadius: '5px',
@@ -641,7 +656,7 @@ const AccountCard = ({ card, onCommand, flush }) => (
     {onCommand ? (
       <Button
         size="small"
-        onClick={() => onCommand(`Paid $0.00 to  for ${card.name}`, true)}
+        onClick={() => onCommand(`Paid $ to  for ${card.name}`, true)}
         sx={{
           mt: 1.25, minHeight: 26, px: 1, fontSize: 12, color: C.inkMid,
           border: `1px solid ${C.line}`, borderRadius: '5px',
@@ -653,6 +668,165 @@ const AccountCard = ({ card, onCommand, flush }) => (
     ) : null}
   </CardShell>
 );
+
+// What was read out of a statement, before any of it is saved.
+//
+// The point of this card is the sentence at the bottom of it: sixty rows were
+// READ, and nothing was written. So it is a manifest — counts, totals, and
+// what still needs a hand — rather than a receipt. The vouchers themselves
+// arrive one at a time in the review panel.
+const StatementCard = ({ card, flush }) => {
+  const [showSkipped, setShowSkipped] = useState(false);
+  const skipped = card.skipped || [];
+  const newParties = card.new_parties || [];
+
+  const Stat = ({ label, value, sub, hue }) => (
+    <Box sx={{ minWidth: 0, flex: '1 1 120px' }}>
+      <Typography sx={{ fontSize: 10.5, color: C.inkMute, textTransform: 'uppercase',
+                        letterSpacing: '0.06em' }}>
+        {label}
+      </Typography>
+      <Typography sx={{ fontSize: 15, fontWeight: 700, color: hue || C.ink,
+                        lineHeight: 1.3 }}>
+        {value}
+      </Typography>
+      {sub ? (
+        <Typography sx={{ fontSize: 11, color: C.inkMute }}>{sub}</Typography>
+      ) : null}
+    </Box>
+  );
+
+  return (
+    <CardShell
+      flush={flush}
+      tone={card.needs_account || card.duplicates ? 'warn' : 'neutral'}
+      title={
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
+          <DescriptionOutlinedIcon sx={{ fontSize: 15, color: C.inkMid, flexShrink: 0 }} />
+          <Typography sx={{ fontSize: 12.5, fontWeight: 700, overflow: 'hidden',
+                            textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {card.filename || 'Statement'}
+          </Typography>
+        </Box>
+      }
+      right={
+        <Typography sx={{ fontSize: 11, color: C.inkMute }}>
+          {card.date_from === card.date_to
+            ? formatDateForDisplay(card.date_from)
+            : `${formatDateForDisplay(card.date_from)} → ${formatDateForDisplay(card.date_to)}`}
+        </Typography>
+      }
+    >
+      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.5, py: 0.5 }}>
+        <Stat label="Received" value={`$${money(card.money_in)}`}
+              sub={`${card.crv_count} CRV`} hue="#065F46" />
+        <Stat label="Paid" value={`$${money(card.money_out)}`}
+              sub={`${card.cpv_count} CPV`} hue={C.accent} />
+        <Stat label="Through" value={card.bank_account || '—'}
+              sub={card.account_hint ? `account ${card.account_hint}` : null} />
+      </Box>
+
+      {(card.needs_account || card.duplicates || newParties.length) ? (
+        <Box sx={{ mt: 1.25, pt: 1, borderTop: `1px solid ${C.line}`,
+                   display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+          {card.needs_account ? (
+            <Typography sx={{ fontSize: 11.5, color: C.inkMid }}>
+              <b>{card.needs_account}</b> need an account picking
+            </Typography>
+          ) : null}
+          {card.duplicates ? (
+            <Typography sx={{ fontSize: 11.5, color: C.warn }}>
+              <b>{card.duplicates}</b> match a voucher already posted that day
+            </Typography>
+          ) : null}
+          {newParties.length ? (
+            <Typography sx={{ fontSize: 11.5, color: C.inkMid }}>
+              <b>{newParties.length}</b> new {newParties.length === 1 ? 'name' : 'names'}
+              {' '}— {newParties.slice(0, 4).join(', ')}
+              {newParties.length > 4 ? ` and ${newParties.length - 4} more` : ''}
+            </Typography>
+          ) : null}
+        </Box>
+      ) : null}
+
+      {skipped.length ? (
+        <Box sx={{ mt: 1 }}>
+          <Button
+            size="small"
+            onClick={() => setShowSkipped((s) => !s)}
+            sx={{ fontSize: 11.5, textTransform: 'none', color: C.inkMid, px: 0.5 }}
+          >
+            {showSkipped ? 'Hide' : 'Show'} {skipped.length} line
+            {skipped.length === 1 ? '' : 's'} I couldn’t read
+          </Button>
+          <Collapse in={showSkipped}>
+            <Box sx={{ mt: 0.5, display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+              {skipped.map((s, i) => (
+                <Box key={i} sx={{ borderLeft: `2px solid ${C.line}`, pl: 1 }}>
+                  <Mono sx={{ fontSize: 10.5, color: C.inkMid, overflowWrap: 'anywhere' }}>
+                    {s.text}
+                  </Mono>
+                  <Typography sx={{ fontSize: 10.5, color: C.inkMute }}>{s.why}</Typography>
+                </Box>
+              ))}
+            </Box>
+          </Collapse>
+        </Box>
+      ) : null}
+
+      <Typography sx={{ mt: 1.25, pt: 1, borderTop: `1px solid ${C.line}`,
+                        fontSize: 11.5, color: C.inkMid }}>
+        Nothing has been written. Each row is saved on its own in the panel.
+      </Typography>
+    </CardShell>
+  );
+};
+
+// The statement named an account this ledger doesn't have — asked once, for
+// the whole file, rather than sixty times with the same field blank.
+const StatementBankPickCard = ({ card, onRetry, busy, flush }) => {
+  const [code, setCode] = useState('');
+  const choices = card.choices || [];
+  return (
+    <CardShell
+      flush={flush}
+      tone="warn"
+      title={<Typography sx={{ fontSize: 12.5, fontWeight: 700 }}>
+        Which account is this?
+      </Typography>}
+      right={<Typography sx={{ fontSize: 11, color: C.inkMute }}>
+        {card.rows} rows waiting
+      </Typography>}
+    >
+      <Autocomplete
+        options={choices}
+        getOptionLabel={(o) => o.qualified || ''}
+        onChange={(_e, v) => setCode(v?.code || '')}
+        size="small"
+        renderInput={(params) => (
+          <TextField {...params} variant="standard" placeholder="Choose an account"
+                     sx={DRAFT_INPUT_SX} />
+        )}
+      />
+      <Button
+        fullWidth
+        size="small"
+        disabled={!code || busy}
+        onClick={() => onRetry?.(code)}
+        sx={{ mt: 1.25, textTransform: 'none', fontSize: 12.5, fontWeight: 600,
+              background: C.accent, color: '#fff', borderRadius: '8px', py: 0.7,
+              '&:hover': { background: '#16304F' },
+              '&.Mui-disabled': { background: '#E8EBF0', color: C.inkMute } }}
+      >
+        {busy ? 'Reading…' : 'Read the statement'}
+      </Button>
+      <Typography sx={{ mt: 0.75, fontSize: 11, color: C.inkMute }}>
+        Every row posts through this account, so it is asked once rather than
+        guessed sixty times.
+      </Typography>
+    </CardShell>
+  );
+};
 
 // A day's vouchers, to pick from. Ticking is how a bulk edit starts: the
 // selected ones open in the review panel one at a time, so a change to twenty
@@ -1198,11 +1372,22 @@ const DraftPreview = ({ draft, kind }) => {
             : ''} />
       <PV label="BANK / CASH" value={draft.bank_account} wide
           tone={draft.bank_acc_code ? undefined : 'warn'} />
+      {/* An account that was DEFAULTED rather than matched looks identical to
+          one that was read off the line, and on a statement most of them are
+          defaults. So the preview says which — otherwise stepping through
+          sixty rows means approving sixty guesses that all look certain. */}
       <PV label={isCRV ? 'INCOME ACCOUNT' : 'EXPENSE ACCOUNT'} wide
           value={draft.category_account}
-          tone={draft.category_acc_code ? undefined : 'warn'} />
+          note={draft.category_acc_code && draft.category_matched === false
+            ? (draft.category_note_short || 'Default used') : undefined}
+          tone={draft.category_acc_code && draft.category_matched !== false
+            ? undefined : 'warn'} />
       <PV label="REFERENCE" value={draft.cheque_no ? `Check #${draft.cheque_no}` : ''} />
-      <PV label="REMARKS" value={draft.description} />
+      {/* On a statement row the remark IS the statement line, which is already
+          shown above in the box that says where it came from. Printing it
+          twice in a panel this narrow just pushes the fields off screen. */}
+      <PV label="REMARKS"
+          value={draft.description === draft.statement_text ? '' : draft.description} />
     </PreviewGrid>
   );
 };
@@ -1303,7 +1488,7 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
   const ready = problems.length === 0;
 
   const SPEC = {
-    voucher: { hue: isCRV ? '#065F46' : C.accent, verb: 'Post to ledger',
+    voucher: { hue: isCRV ? '#065F46' : C.accent, verb: 'Save',
                title: isCRV ? 'CRV' : 'CPV', busy: 'Posting…',
                sub: isCRV ? 'Money in — check and post' : 'Money out — check and post',
                foot: 'Nothing is written until you post.' },
@@ -1425,6 +1610,25 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
         );
       })() : null}
 
+      {/* The line this came off, when it came off a statement. It is the only
+          thing that ties the draft back to the page it was read from, and it
+          is what you check the fields against — so it sits above them, as
+          printed, rather than being paraphrased into a description. */}
+      {draft.statement_text ? (
+        <Box sx={{ px: 1.5, pb: 1 }}>
+          <Typography sx={{ fontSize: 10, color: C.inkMute, textTransform: 'uppercase',
+                            letterSpacing: '0.06em', mb: 0.3 }}>
+            From the statement
+            {draft.statement_section ? ` · ${draft.statement_section}` : ''}
+          </Typography>
+          <Mono sx={{ fontSize: 10.5, color: C.inkMid, lineHeight: 1.45,
+                      display: 'block', background: C.raised, borderRadius: '6px',
+                      px: 0.9, py: 0.7, overflowWrap: 'anywhere' }}>
+            {draft.statement_text}
+          </Mono>
+        </Box>
+      ) : null}
+
       {/* Fields — the document, or the form that corrects it */}
       <Box sx={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
         {!editing ? <DraftPreview draft={draft} kind={kind} />
@@ -1526,7 +1730,8 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
             ? undefined : 'warn'}
           hint={!draft.category_acc_code
             ? (draft.category_note_short || 'Not matched — choose it')
-            : (draft.category_matched === false ? 'Default used' : undefined)}
+            : (draft.category_matched === false
+                ? (draft.category_note_short || 'Default used') : undefined)}
         >
           <Autocomplete
             options={catOptions}
@@ -1778,7 +1983,8 @@ const friendlyNetworkError = (error) => {
 };
 
 
-const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit, busy }) => {
+const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
+                   onStatementAccount, busy }) => {
   if (msg.type === 'user') {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'flex-start',
@@ -1789,6 +1995,14 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit, busy })
             background: C.accent, color: '#fff',
           }}
         >
+          {msg.attachment ? (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.4 }}>
+              <DescriptionOutlinedIcon sx={{ fontSize: 15, opacity: 0.85 }} />
+              <Typography sx={{ fontSize: 11, opacity: 0.85 }}>
+                {(msg.attachment.size / 1024).toFixed(0)} KB
+              </Typography>
+            </Box>
+          ) : null}
           <Typography sx={{ fontSize: 13.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
             {msg.content}
           </Typography>
@@ -1810,7 +2024,7 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit, busy })
       <Box sx={{ flex: 1, minWidth: 0 }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.6 }}>
         <Typography sx={{ fontSize: 11.5, fontWeight: 600, color: C.ink, letterSpacing: '0.02em' }}>
-          LockInLedger Assistant
+          LedgerAssist
         </Typography>
         <Typography sx={{ fontSize: 11, color: C.inkMute }}>{clockTime(msg.timestamp)}</Typography>
         {msg.isError ? <Pill label="Not posted" tone="err" /> : null}
@@ -1873,7 +2087,6 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit, busy })
             >
               {msg.draftPosted ? 'Done' : 'Review →'}
             </Button>
-            {!msg.draftPosted}
           </Box>
         ) : null}
         {msg.suggestions?.length ? (
@@ -1911,6 +2124,11 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit, busy })
           ? <AccountCard card={msg.card} onCommand={onCommand} flush={bare} /> : null}
         {msg.card?.kind === 'voucher_list'
           ? <VoucherListCard card={msg.card} onBulkEdit={onBulkEdit} busy={busy} /> : null}
+        {msg.card?.kind === 'statement_summary'
+          ? <StatementCard card={msg.card} flush={bare} /> : null}
+        {msg.card?.kind === 'statement_bank_pick'
+          ? <StatementBankPickCard card={msg.card} onRetry={onStatementAccount}
+                                   busy={busy} flush={bare} /> : null}
       </Shell>
       </Box>
     </Box>
@@ -1989,13 +2207,15 @@ const PLACEHOLDERS = {
   cpv: 'Paid $450 to Handy Fix LLC for repair and maintenance from Bank of America 9523',
   crv: 'Received $1,250 from ABC Trading for invoice 2045 into Chase Bank 4582',
   post: 'Paid $450 to Handy Fix LLC for repair and maintenance from Bank of America 9523',
-  update: '260902000001 amount 500  —  or a date like 7-june-2026 for a whole day',
+  update: '261203000165 amount 500  —  or a date like 7-june-2026 for a whole day',
   view: 'show my transactions',
   profile: 'Add ABC Trading LLC as a new customer, phone 555-123-4567',
   editprofile: "Change ABC Trading's phone number to 555-987-6543",
   editchart: 'rename account Fuel to Fuel and Oil',
   chart: 'add bank account Meezan 1234',
   chartview: 'show chart',
+  // Nothing to type — the attach button beside this box is the command.
+  statement: 'Attach a statement with the paperclip, or drop it onto the chat',
 };
 
 // What each job needs, in that job's own words. Pressing a command in the rail
@@ -2003,7 +2223,7 @@ const PLACEHOLDERS = {
 // now?" is on screen for the thing you just said you wanted to do.
 const INTRO = {
   cpv: {
-    hue: C.accent, title: 'Create a CPV — Payment',
+    hue: C.accent, title: 'Create a CPV \u2014 Payment',
     blurb: 'Enter the payee, amount, purpose/expense category, and payment account.',
     examples: [
       ['Paid $450 to Handy Fix LLC for repair and maintenance from Bank of America 9523',
@@ -2017,7 +2237,7 @@ const INTRO = {
       + 'account and the date are filled in for you to check if you leave them out.',
   },
   crv: {
-    hue: '#065F46', title: 'Create Cash Receipt Voucher (CRV) — Funds Received',
+    hue: '#065F46', title: 'Create Cash Receipt Voucher (CRV) \u2014 Funds Received',
     blurb: ' Enter the payer, amount, reference/invoice number, and deposit account.',
     examples: [
       ['Received $1,250 from ABC Trading for invoice 2045 into Chase Bank 4582',
@@ -2030,14 +2250,33 @@ const INTRO = {
     hint: 'The amount, the payer and the bank account are what I need. The income '
       + 'account and the date are filled in for you to check if you leave them out.',
   },
+  statement: {
+    hue: C.violet, title: 'Read a Statement — CRV and CPV from a PDF',
+    blurb: 'Attach a bank or credit-card statement. Every line comes back as a '
+      + 'draft voucher for you to check — deposits as CRVs, withdrawals as CPVs.',
+    examples: [
+      ['Choose a PDF or CSV your bank gave you',
+       'A downloaded statement, not a scan or a photo — a scan has no text to read.'],
+      ['One account per file',
+       'It reads the account number off the page; if that matches nothing, it asks '
+       + 'once rather than leaving every row blank.'],
+      ['Read the rows, save them one at a time',
+       'Nothing is written by uploading. Each row is saved on its own, or skipped.'],
+      ['Names you have already get matched',
+       'The rest are marked new, and a profile is created only when you save that row.'],
+    ],
+    hint: 'The typing is bulk and so is the reading. The writing never is — '
+      + 'sixty rows is still sixty confirmations.',
+  },
   update: {
     hue: C.warn, title: 'Edit Voucher',
     blurb: 'Provide a Voucher ID for direct editing, or a date to view daily entries.',
     examples: [
-      ['260902000001', 'Retrieve a voucher record for review and corrections'],
-      ['Edit voucher 260902000001 and change the amount to $500', 'Modify voucher fields (e.g., amount, date, bank, or category).'],
+      ['261203000165', 'Retrieve a voucher record for review and corrections'],
+      ['Edit voucher 261203000165 and change the amount to $500', 'Modify voucher fields (e.g., amount, date, bank, or category).'],
       ['7-june-2026', "Display all entries for a specific day to select records for modification."],
-      // ['Void 260902000001', 'cancel a voucher that should not exist'],
+      ['Change note to Reviewed for all vouchers on 7-june-2026',
+       'One change across a whole day \u2014 still confirmed one at a time.'],
     ],
     hint: 'Modifies only named fields (amount, date, vendor, bank, category, '
       + ' check no., remarks). Details open in the right panel for preview. '
@@ -2078,7 +2317,7 @@ const INTRO = {
        'Update multiple profile fields simultaneouslye'],
       ['update vendor Handy Fix LLC, title Facilities Manager', 'Modify any stored metadata field'],
     ],
-    hint: ' The profile retains its unique account code and transaction history—only master data details are updated.'
+    hint: ' The profile retains its unique account code and transaction history\u2014only master data details are updated.'
       + ' Entity classification (Customer, Vendor, or Employee) is permanently linked to the account code sequence; create a new profile if a different entity type is required. '
   },
   editchart: {
@@ -2267,6 +2506,9 @@ const QUICK_ACTIONS = [
   { key: 'crv', label: 'Create CRV', hint: 'Recieved',
     Icon: SouthWestIcon, mode: 'crv', prefill: 'Received ',
     hue: '#065F46', soft: C.okSoft },
+  { key: 'statement', label: 'Read a Statement', hint: 'CRV and CPV from a PDF',
+    Icon: UploadFileIcon, mode: 'statement', prefill: '', upload: true,
+    hue: C.violet, soft: C.violetSoft },
   { key: 'update', label: 'Edit Voucher', hint: 'By ID or by Date',
     Icon: EditIcon, mode: 'update', prefill: '',
     hue: C.warn, soft: C.warnSoft },
@@ -2281,7 +2523,7 @@ const QUICK_ACTIONS = [
     hue: C.blue, soft: C.blueSoft },
   { key: 'chart', label: 'Create Chart of Accounts', hint: 'A new ledger account',
     Icon: AccountTreeIcon, mode: 'chart', prefill: 'add account ',
-    hue: C.violet, soft: C.violetSoft }, 
+    hue: C.violet, soft: C.violetSoft },
   { key: 'editchart', label: 'Rename or Deactivate Account', hint: 'Manage your chart of accounts',
     Icon: DriveFileRenameIcon, mode: 'editchart', prefill: 'rename account ',
     hue: C.violet, soft: C.violetSoft },
@@ -2511,6 +2753,12 @@ export default function App() {
   // edit is just a queue of one.
   const [queue, setQueue] = useState(null);   // { drafts, index, saved:Set }
   const [postError, setPostError] = useState(null);
+  // A statement held between the upload and the answer to "which account is
+  // this?", so answering re-reads the file the person already chose rather
+  // than making them find it again.
+  const [pendingStatement, setPendingStatement] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileRef = useRef(null);
   // The real chart and party list, so a correction picks a code that exists.
   const [pickers, setPickers] = useState({ bank: [], income: [], expense: [], all: [] });
   const [parties, setParties] = useState([]);
@@ -2605,6 +2853,20 @@ export default function App() {
   const runQuickAction = useCallback((a) => {
     setMode(a.mode);
     setInputMessage(a.prefill);
+    // The one action that isn't a sentence to finish. It still shows its
+    // intro first — a file dialog opening with no explanation is the worst
+    // possible introduction to the one feature that reads sixty rows at once.
+    if (a.upload) {
+      setMessages((prev) => {
+        const intro = INTRO[a.mode];
+        const last = prev[prev.length - 1];
+        if (!intro || last?.intro === intro) return prev;
+        return [...prev, { id: Date.now(), type: 'bot', timestamp: new Date(),
+                           intro, introKey: a.mode }];
+      });
+      fileRef.current?.click();
+      return;
+    }
     const intro = INTRO[a.mode];
     if (intro) {
       setMessages((prev) => {
@@ -2633,6 +2895,83 @@ export default function App() {
     inputRef.current?.focus();
   }, []);
 
+  // ---- A statement, read in --------------------------------------------
+  //
+  // Deliberately the same shape as sending a sentence: it posts, it gets a
+  // queue of drafts back, and it opens the first one. There is no "import"
+  // button anywhere after this point, because there is nothing to import —
+  // the rows are saved by the same Save button as everything else, one at a
+  // time. The file never touches the ledger; only the drafts do.
+  const uploadStatement = useCallback(async (file, bankAccount) => {
+    if (!file || isLoading) return;
+    if (file.size > STATEMENT_MAX_MB * 1024 * 1024) {
+      showSnack(`${file.name} is over ${STATEMENT_MAX_MB} MB`, 'warning');
+      return;
+    }
+
+    setMessages((prev) => [...prev, {
+      id: Date.now(), type: 'user', timestamp: new Date(),
+      content: bankAccount ? `${file.name} — read it into ${bankAccount}`
+                           : `${file.name}`,
+      attachment: { name: file.name, size: file.size },
+    }]);
+    setIsLoading(true);
+    setPendingStatement({ file });
+
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      if (sessionId) form.append('session_id', sessionId);
+      if (bankAccount) form.append('bank_account', bankAccount);
+
+      // Reading sixty rows against the chart takes longer than a sentence
+      // does, and the default timeout would cut it off mid-file.
+      const { data } = await axios.post(`${API_BASE_URL}/api/statement/preview`,
+                                        form, { timeout: 180000 });
+
+      if (data.status === 'draft' && data.drafts?.length) {
+        setMessages((prev) => [...prev, {
+          id: Date.now() + 1, type: 'bot', timestamp: new Date(),
+          content: data.message || data.analysis || '',
+          card: data.card || null,
+        }]);
+        setQueue({ drafts: data.drafts, index: 0, saved: new Set() });
+        setDraft(data.drafts[0]);
+        setDraftMsgId(null);
+        setPostError(null);
+        setPendingStatement(null);
+        return;
+      }
+
+      setMessages((prev) => [...prev, {
+        id: Date.now() + 1, type: 'bot', timestamp: new Date(),
+        content: data.message || data.analysis || 'Nothing was read in.',
+        card: data.card || null,
+        isError: data.status === 'error',
+      }]);
+      // The account question is the one failure worth staying open for: the
+      // file is still here, so answering it re-reads rather than re-uploads.
+      if (data.action !== 'statement_needs_bank') setPendingStatement(null);
+      if (data.status === 'error') showSnack('Nothing was read in', 'warning');
+    } catch (error) {
+      setMessages((prev) => [...prev, {
+        id: Date.now() + 1, type: 'bot', isError: true, timestamp: new Date(),
+        content: friendlyNetworkError(error),
+      }]);
+      setPendingStatement(null);
+      showSnack('Could not read that file', 'error');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [api, sessionId, isLoading, showSnack]);
+
+  const retryStatementWithAccount = useCallback((code) => {
+    const acc = (pickers.all || []).find((a) => String(a.code) === String(code));
+    if (pendingStatement?.file) {
+      uploadStatement(pendingStatement.file, acc?.qualified || String(code));
+    }
+  }, [pendingStatement, pickers, uploadStatement]);
+
   const sendMessage = async (overrideText) => {
     const text = (overrideText ?? inputMessage).trim();
     if (!text || isLoading) return;
@@ -2648,6 +2987,22 @@ export default function App() {
       const { data } = await api.post('/api/chat', {
         session_id: sessionId, message: text, mode, preview: true,
       });
+
+      // ---- a whole day, opened as a queue ---------------------------------
+      // "change party to 3S for all vouchers on 2026-09-04" comes back as many
+      // drafts. Same queue the tick-list builds, so each one is still read and
+      // saved on its own — the sentence is bulk, the writing is not.
+      if (data.status === 'draft' && data.drafts?.length > 1) {
+        setMessages((prev) => [...prev, {
+          id: Date.now() + 1, type: 'bot', timestamp: new Date(),
+          content: data.message || data.analysis || '',
+        }]);
+        setQueue({ drafts: data.drafts, index: 0, saved: new Set() });
+        setDraft(data.drafts[0]);
+        setDraftMsgId(null);
+        setPostError(null);
+        return;
+      }
 
       // ---- the confirmation step -----------------------------------------
       if (data.status === 'draft' && data.draft) {
@@ -2863,12 +3218,17 @@ export default function App() {
         checkConnection();
       }
 
-      // In a queue, saving moves to the next voucher rather than closing the
-      // panel — that is the whole point of stepping through a bulk edit.
-      if (kind === 'edit' && queue && queue.drafts.length > 1) {
-        const saved = new Set(queue.saved).add(d.at_id);
-        const nextIdx = queue.drafts.findIndex((x, i) => i > queue.index && !saved.has(x.at_id));
-        const fallback = queue.drafts.findIndex((x) => !saved.has(x.at_id));
+      // In a queue, saving moves to the next one rather than closing the
+      // panel — that is the whole point of stepping through a bulk edit, and
+      // of a statement.
+      //
+      // Keyed on draftKey rather than at_id: an edit queue is identified by
+      // the voucher it opens, but a statement queue is sixty vouchers that do
+      // not exist yet and have no id to key on.
+      if (queue && queue.drafts.length > 1) {
+        const saved = new Set(queue.saved).add(draftKey(d));
+        const nextIdx = queue.drafts.findIndex((x, i) => i > queue.index && !saved.has(draftKey(x)));
+        const fallback = queue.drafts.findIndex((x) => !saved.has(draftKey(x)));
         const go = nextIdx >= 0 ? nextIdx : fallback;
         if (go >= 0) {
           setQueue({ ...queue, index: go, saved });
@@ -2991,7 +3351,7 @@ export default function App() {
           <Box sx={{ minWidth: 0 }}>
             <Typography sx={{ fontSize: 14.5, fontWeight: 700, letterSpacing: '-0.01em',
                               lineHeight: 1.25 }}>
-              LockInLedger Assistant
+              LedgerAssist
             </Typography>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.6 }}>
               <Box sx={{ width: 6, height: 6, borderRadius: '50%',
@@ -3053,14 +3413,51 @@ export default function App() {
                    gridTemplateColumns: { xs: '1fr',
                      lg: draft ? '1fr 380px' : '1fr 320px' } }}>
           {/* Conversation */}
-          <Box sx={{ display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
+          <Box
+            sx={{ display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0,
+                  position: 'relative' }}
+            onDragOver={(e) => {
+              if (!e.dataTransfer?.types?.includes('Files')) return;
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={(e) => {
+              // Only when the pointer leaves the region itself — dragging over
+              // a child fires dragleave on the parent and would flicker.
+              if (e.currentTarget.contains(e.relatedTarget)) return;
+              setDragOver(false);
+            }}
+            onDrop={(e) => {
+              if (!e.dataTransfer?.files?.length) return;
+              e.preventDefault();
+              setDragOver(false);
+              uploadStatement(e.dataTransfer.files[0]);
+            }}
+          >
+            {dragOver ? (
+              <Box sx={{
+                position: 'absolute', inset: 10, zIndex: 5, borderRadius: '12px',
+                border: `2px dashed ${C.accent}`, background: 'rgba(255,255,255,0.92)',
+                display: 'flex', flexDirection: 'column', alignItems: 'center',
+                justifyContent: 'center', gap: 1, pointerEvents: 'none',
+              }}>
+                <UploadFileIcon sx={{ fontSize: 30, color: C.accent }} />
+                <Typography sx={{ fontSize: 13.5, fontWeight: 600, color: C.accent }}>
+                  Drop a statement to read it
+                </Typography>
+                <Typography sx={{ fontSize: 11.5, color: C.inkMute }}>
+                  PDF or CSV — nothing is posted until you save each row
+                </Typography>
+              </Box>
+            ) : null}
             <Box sx={{ flex: 1, overflowY: 'auto', px: { xs: 2, md: 4 }, py: 3 }}>
               <Box sx={{ maxWidth: 780, mx: 'auto' }}>
                 {messages.map((m) => (
                   <Message key={m.id} msg={m} onCommand={loadIntoComposer}
                            onSuggest={(t) => sendMessage(t)}
                            onReopenDraft={reopenDraft} onBulkEdit={bulkEdit}
-                           busy={posting} />
+                           onStatementAccount={retryStatementWithAccount}
+                           busy={posting || isLoading} />
                 ))}
                 {isLoading ? (
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, mb: 2.5,
@@ -3095,6 +3492,20 @@ export default function App() {
                 <Box sx={{ display: 'flex', alignItems: 'flex-end', gap: 1 }}>
                   <AutoAwesomeIcon sx={{ fontSize: 17, color: C.accent, flexShrink: 0,
                                          mb: '3px' }} />
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    accept={STATEMENT_TYPES}
+                    style={{ display: 'none' }}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      // Cleared so choosing the SAME file twice still fires —
+                      // a re-upload after picking the account is the common
+                      // case, not the rare one.
+                      e.target.value = '';
+                      if (f) uploadStatement(f);
+                    }}
+                  />
                   <TextField
                     inputRef={inputRef}
                     fullWidth
@@ -3117,6 +3528,22 @@ export default function App() {
                       '& .MuiInputBase-input::placeholder': { color: C.inkMute, opacity: 1 },
                     }}
                   />
+                  <Tooltip title="Read a bank or card statement (PDF, CSV)">
+                    <span>
+                      <IconButton
+                        onClick={() => fileRef.current?.click()}
+                        disabled={isLoading}
+                        sx={{
+                          width: 34, height: 34, flexShrink: 0, borderRadius: '9px',
+                          color: C.inkMid, border: `1px solid ${C.line}`,
+                          '&:hover': { borderColor: C.accent, color: C.accent,
+                                       background: C.accentSoft },
+                        }}
+                      >
+                        <AttachFileIcon sx={{ fontSize: 17 }} />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
                   <IconButton
                     onClick={() => sendMessage()}
                     disabled={!inputMessage.trim() || isLoading}

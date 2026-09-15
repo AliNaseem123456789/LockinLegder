@@ -68,3 +68,25 @@ timestamp,session_id,user_message,action,entry_type,amount,party_name,descriptio
 2026-09-08T22:51:15.446787,session_1788889686941_1u27yzwfi,Paid $450 to 3S for Healthcare services from Bank of Amercia 9523,create_transaction,CPV,450.0,3S,Healthcare services,,,Bank of Amercia 9523,Healthcare services
 2026-09-08T22:55:35.199492,session_1788889686941_1u27yzwfi,Paid $450 to 3S for Healthcare services from Bank of America 9523,create_transaction,CPV,450.0,3S,Healthcare services,,,Bank of America 9523,Healthcare services
 2026-09-09T00:17:58.807880,session_1788895020051_uog602row,Paid $750 to John Smith for consulting services from cash,create_transaction,CPV,750.0,John Smith,consulting services,,,cash,consulting services
+2026-09-10T19:00:58.649225,session_1789048563657_5ub9ej58g,"Received $1,250 from ABC Trading for invoice 2045 into Chase Bank 4582",create_transaction,CRV,1250.0,ABC Trading,invoice 2045,,,Chase Bank 4582,invoice 2045
+2026-09-10T19:03:08.887282,session_1789048953325_nldmcui93,Paid $450 to 3S for repair and maintenance from Bank of America 9523,create_transaction,CPV,450.0,3S,repair and maintenance,,,Bank of America 9523,repair and maintenance
+2026-09-10T19:08:13.155571,session_1789048953325_nldmcui93,"Received $1,250 from ABC Trading for invoice 2045 into Chase Bank 4582",create_transaction,CRV,1250.0,ABC Trading,invoice 2045,,,Chase Bank 4582,invoice 2045
+2026-09-10T19:12:07.751877,session_1789049504744_wlngub827,"Received $2,000 from ABC Trading for sales into Bank of America 9523",create_transaction,CRV,2000.0,ABC Trading,sales,,,Bank of America 9523,sales
+2026-09-10T19:21:29.203604,session_1789049960528_moxblk56q,"Received $2,000 from ABC Trading for sales into Bank of America 9523",create_transaction,CRV,2000.0,ABC Trading,sales,,,Bank of America 9523,sales
+2026-09-10T19:22:03.850908,session_1789049960528_moxblk56q,Received $750 cash from Handy Fix LLC for invoice 3050 today,create_transaction,CRV,750.0,Handy Fix LLC,invoice 3050,2026-09-10,,,invoice 3050
+2026-09-10T19:24:52.979675,session_1789049960528_moxblk56q,change name to 3S on date 2026-09-04,unparsed,,,,,,,,
+2026-09-10T19:25:10.986383,session_1789049960528_moxblk56q,2026-09-04 update name to 3S,unparsed,,,,,,,,
+2026-09-10T19:25:35.956109,session_1789049960528_moxblk56q,update name to 3S 2026-09-04,unparsed,,,,,,,,
+2026-09-10T19:25:53.057928,session_1789049960528_moxblk56q,Edit 2026-09-04 and change the amount to $500,unparsed,,,,,,,,
+2026-09-10T19:27:57.302961,session_1789049960528_moxblk56q,Paid $750 to John Smith for consulting services from bank of amercia 9523,create_transaction,CPV,750.0,John Smith,consulting services,,,bank of amercia 9523,consulting services
+2026-09-10T19:28:48.469095,session_1789050510071_e19551xqn,Paid $750 to John Smith for consulting services from bank of amercia 9523,create_transaction,CPV,750.0,John Smith,consulting services,,,bank of amercia 9523,consulting services
+2026-09-10T19:29:57.121364,session_1789050572664_l2cfsjpck,"Received $2,000 from ABC Trading for sales into Bank of Amercia 9523",create_transaction,CRV,2000.0,ABC Trading,sales,,,Bank of Amercia 9523,sales
+2026-09-10T20:01:10.982658,session_1789050572664_l2cfsjpck,2026-09-04 change name to 3S for all,unparsed,,,,,,,,
+2026-09-10T20:04:09.168577,session_1789050572664_l2cfsjpck,change name to 3S for vouchers posted on 2026-09-04,unparsed,,,,,,,,
+2026-09-10T20:59:20.487182,session_1789055463578_lpejs7x66,update customer Example456 name to Example567 phone number to 0001112233344,unparsed,,,,,,,,
+2026-09-10T20:59:33.481174,session_1789055463578_lpejs7x66,update customer Example456 name to Example567,unparsed,,,,,,,,
+2026-09-10T21:00:35.328695,session_1789055463578_lpejs7x66,Paid $0.00 to  3S for Software Subscriptions into Meexan bank 1234,create_transaction,CPV,0.0,3S,Software Subscriptions,,,Meexan bank 1234,Software Subscriptions
+2026-09-10T21:00:52.325394,session_1789055463578_lpejs7x66,Paid $100 to  3S for Software Subscriptions into Meexan bank 1234,create_transaction,CPV,100.0,3S,Software Subscriptions,,,Meexan bank 1234,Software Subscriptions
+2026-09-11T19:13:10.633672,session_1789135638616_6jo9ejxvz,paid 450 handy fix llc repair maintanence bofa 9523,create_transaction,CPV,450.0,450 Handy Fix LLC Repair Maintanence Bofa 9523,Payment Voucher,,,,
+2026-09-11T19:23:16.499648,session_1789135638616_6jo9ejxvz,paid 450 handy fix llc repair maintanence bofa 9523,create_transaction,CPV,450.0,450 Handy Fix LLC Repair Maintanence Bofa 9523,Payment Voucher,,,,
+2026-09-15T18:34:24.905354,session_1789479247487_fi4ll55ra,Paid $450 to Handy Fix LLC for repair and maintenance from Bank of America 9523,create_transaction,CPV,450.0,Handy Fix LLC,repair and maintenance,,,Bank of America 9523,repair and maintenance
