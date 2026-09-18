@@ -2911,7 +2911,8 @@ def _llm_ask(system: str, user: str, *, max_tokens: int = 300,
             model=bot.model,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
-            temperature=temperature, max_tokens=max_tokens, timeout=8,
+            # temperature=temperature, max_tokens=max_tokens, timeout=8,
+            temperature=temperature, max_tokens=max_tokens, timeout=20,
         )
         out = (r.choices[0].message.content or '').strip()
         _llm_note_ok()
@@ -3077,7 +3078,8 @@ def _llm_pick_account(search_text: str, candidates: List[Dict], what: str,
     out = _llm_ask(_PICK_SYSTEM,
                    f"The bookkeeper wrote: \"{search_text}\"\n"
                    f"It should be one of these {kind}s:\n{listing}",
-                   max_tokens=60)
+                   max_tokens=300)
+                #    max_tokens=60)
     if not out:
         return None
     answer = out.splitlines()[0].strip().strip('-`" ')
@@ -3119,7 +3121,8 @@ def _voice(text: str, must_keep: Optional[List[str]] = None) -> str:
                        "words, no emoji, no greeting, no sign-off. Reply with the "
                        "rewritten message only."},
                       {"role": "user", "content": text}],
-            temperature=0.2, max_tokens=260, timeout=6,
+            temperature=0.2, max_tokens=260, timeout=20,
+            # temperature=0.2, max_tokens=260, timeout=6,
         )
         out = strip_emojis((r.choices[0].message.content or '').strip())
     except Exception as e:
@@ -3707,7 +3710,8 @@ class AccountingBot:
         # The model name doesn't depend on whether a key was found - keeping it
         # unconditional means anything that reads self.model (the voice pass,
         # /api/debug/extract) works the same however the client got attached.
-        self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        # self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
         if api_key:
             self.groq_client = Groq(api_key=api_key)
             print(f"Groq client initialized ({self.model})")
