@@ -1,0 +1,82 @@
+# Render blueprint for the LedgerAssist backend.
+#
+# Put this at the ROOT of the repo you connect to Render. With it present you
+# can use "New > Blueprint" and Render reads the service from here instead of
+# you filling the form in by hand.
+#
+# runtime: python  -> Render's own Python image. No pdftotext (see Dockerfile).
+# Swap to  runtime: docker  and delete buildCommand/startCommand if you use it.
+
+services:
+  - type: web
+    name: ledgerassist-api
+    runtime: python
+    plan: starter            # free also works; it sleeps after 15 min idle
+    region: oregon           # pick the one nearest the MySQL host
+    buildCommand: pip install -r requirements.txt
+
+    # ONE worker, deliberately. The bot keeps session DB connections, the LLM
+    # circuit breaker and the statement budget in module-level state, so a
+    # second worker would serve half the requests from a different copy of it.
+    startCommand: uvicorn main2:app --host 0.0.0.0 --port $PORT --workers 1
+
+    # "/" and not "/api/health". Render pings this every few seconds, and
+    # /api/health opens a fresh MySQL connection, counts acc_party and
+    # re-reads the whole chart with force=True on EVERY call - a real query
+    # load for something whose only job is to say the process is up. "/" is a
+    # static dict. Use /api/health by hand when you want the real answer.
+    healthCheckPath: /
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
+      # --- LockInLedger's database ---------------------------------------
+      # Set these in the dashboard, not here. sync: false means "prompt me,
+      # don't store it in git".
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "3306"
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: SYSTEM_ID
+        value: "146"
+
+      # --- the model -------------------------------------------------------
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: "openai/gpt-oss-20b"
+
+      # --- statement import -------------------------------------------------
+      # The ceiling on model calls for ONE statement. 25 is the default; drop
+      # it to 0 if an import is timing out and you would rather have the rows
+      # flagged than guessed.
+      - key: STATEMENT_LLM_MAX
+        value: "25"
+      - key: STATEMENT_MAX_BYTES
+        value: "15728640"
+
+      # --- defaults that stop every statement row needing a category picked --
+      - key: DEFAULT_REVENUE_ACC
+        sync: false
+      - key: DEFAULT_EXPENSE_ACC
+        sync: false
+
+      # --- audit trail -------------------------------------------------------
+      # Render's disk is wiped on every deploy and restart, so this trail does
+      # not survive one. It is left ON because it costs nothing and is useful
+      # within a session; set AUDIT_ENABLED=0 to silence it, or attach a
+      # persistent disk and point AUDIT_DIR at the mount to make it real.
+      - key: AUDIT_ENABLED
+        value: "1"
+      - key: AUDIT_REQUIRED
+        value: "0"
+
+      - key: ASSISTANT_VOICE
+        value: "1"
