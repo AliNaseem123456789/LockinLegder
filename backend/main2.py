@@ -7292,7 +7292,8 @@ async def root():
     return {"bot": bot.name, "status": "online", "database": "MySQL",
             "version": "v6 - chat posting + voucher update + profile creation + chart of accounts"}
 
-
+import audit_log
+audit_log.register(app, bot)
 if __name__ == "__main__":
     import uvicorn
     print(f"\n{'='*62}\n{bot.name} - AI Accounting Bot (v6)\n{'='*62}")

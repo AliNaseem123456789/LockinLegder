@@ -96,3 +96,4 @@ timestamp,session_id,user_message,action,entry_type,amount,party_name,descriptio
 2026-09-18T18:59:17.598735,session_1789739942207_3wj6t1d87,Paid $750 to John Smith for consulting services from cash,create_transaction,CPV,750,John Smith,consulting services,,,cash,consulting services
 2026-09-18T19:00:36.384837,session_1789739942207_3wj6t1d87,"Received $1,250 from ABC Trading for invoice 2045 into Chase Bank 4582",create_transaction,CRV,1250.0,ABC Trading,invoice 2045,,,Chase Bank 4582,invoice 2045
 2026-09-18T19:00:44.126617,session_1789739942207_3wj6t1d87,Received 1250 from ABC Trading for invoice 2045 into Chase Bank 4582,create_transaction,CRV,1250.0,ABC Trading,invoice 2045,,,Chase Bank 4582,invoice 2045
+2026-09-18T21:14:29.246092,session_1789739942207_3wj6t1d87,audit,help,,,,,,,,
