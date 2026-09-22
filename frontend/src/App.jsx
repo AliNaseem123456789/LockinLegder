@@ -59,7 +59,8 @@ import axios from 'axios';
 // referencing it throws at module load, which blanks the whole app. Set the URL
 // from index.html when it differs from the default:
 //     <script>window.__API_BASE_URL__ = "https://ledger.internal:8000";</script>
-const API_BASE_URL ="http://51.20.161.161"
+const API_BASE_URL ="https://lockinledgerwebsite.duckdns.org"
+// const API_BASE_URL ="http://51.20.161.161"
 // const API_BASE_URL =
 //   (typeof window !== 'undefined' && window.__API_BASE_URL__) || 'http://localhost:8000';
 
