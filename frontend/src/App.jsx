@@ -2253,7 +2253,7 @@ const INTRO = {
       + 'account and the date are filled in for you to check if you leave them out.',
   },
   statement: {
-    hue: C.violet, title: 'Read a Statement — CRV and CPV from a PDF',
+    hue: C.violet, title: 'Attach Statement — CRV and CPV from a PDF',
     blurb: 'Attach a bank or credit-card statement. Every line comes back as a '
       + 'draft voucher for you to check — deposits as CRVs, withdrawals as CPVs.',
     examples: [
