@@ -363,6 +363,16 @@ STRICT_FISCAL_YEAR = os.getenv("STRICT_FISCAL_YEAR", "0") == "1"
 # so this only ever changes wording. ASSISTANT_VOICE=0 turns it off.
 ASSISTANT_VOICE = os.getenv("ASSISTANT_VOICE", "1") == "1"
 
+# The most model calls one statement import is allowed to make, in total.
+#
+# A 67-row statement used to ask the model about every row it couldn't match
+# locally - 58 sequential round trips, roughly a minute of pure waiting, and
+# the browser gives up at three. This is the ceiling for a whole file; rows
+# past it resolve locally or come back as "pick this one", which is a visible
+# blank the operator fills rather than a lost upload. 0 turns the model off
+# for statements entirely and makes the import near-instant.
+STATEMENT_LLM_MAX = int(os.getenv("STATEMENT_LLM_MAX", "25"))
+
 # What the button the person pressed says about what they are probably doing.
 # Passed to the model as context, never used as a decision - the sentence wins.
 MODE_HINT = {
@@ -1010,13 +1020,23 @@ def _rule_based_extract(message: str) -> Dict[str, Any]:
 # into the wrong fiscal year, so it is read explicitly rather than assumed to
 # be "now" - a January statement is very often read in February, and a
 # December-to-January one straddles two years at once.
+# The separator between the two dates is written every way a bank can think
+# of: spaced, unspaced, hyphen, en dash, em dash, "through", "thru". The first
+# version of this required whitespace on BOTH sides of it, so
+# "August 01, 2025-August 29, 2025" - which is what pdfplumber gives for a
+# header the layout extractor spaces out - matched nothing at all. No match
+# means no year, and no year silently means "this one", which posts a
+# December statement read in January twelve months out.
+_STMT_PERIOD_SEP = r'(?:\s*[-–—]\s*|\s+(?:through|thru|to|until)\s+)'
+
 _STMT_PERIOD_RES = [
-    # "August 01, 2025 through August 29, 2025"
-    re.compile(r'(?P<m1>[A-Z][a-z]+)\s+(?P<d1>\d{1,2}),?\s+(?P<y1>\d{4})\s+'
-               r'(?:through|to|-|–)\s+'
-               r'(?P<m2>[A-Z][a-z]+)\s+(?P<d2>\d{1,2}),?\s+(?P<y2>\d{4})'),
+    # "August 01, 2025 through August 29, 2025" / "August 01, 2025-August 29, 2025"
+    re.compile(r'(?P<m1>[A-Z][a-z]+)\s*(?P<d1>\d{1,2}),?\s*(?P<y1>\d{4})'
+               + _STMT_PERIOD_SEP +
+               r'(?P<m2>[A-Z][a-z]+)\s*(?P<d2>\d{1,2}),?\s*(?P<y2>\d{4})'),
     # "Opening/Closing Date  08/05/25 - 09/04/25"
-    re.compile(r'(?P<mm1>\d{1,2})/(?P<dd1>\d{1,2})/(?P<yy1>\d{2,4})\s*(?:-|–|through|to)\s*'
+    re.compile(r'(?P<mm1>\d{1,2})/(?P<dd1>\d{1,2})/(?P<yy1>\d{2,4})'
+               + _STMT_PERIOD_SEP +
                r'(?P<mm2>\d{1,2})/(?P<dd2>\d{1,2})/(?P<yy2>\d{2,4})'),
 ]
 
@@ -1128,9 +1148,15 @@ class StatementRow(NamedTuple):
 
 def _stmt_year_window(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """(start_month, start_year, end_year) from the statement header."""
-    head = text[:6000]
+    # This used to read the first 6000 characters only, on the reasoning that
+    # a header is at the top. It usually is - but a statement whose first page
+    # is a marketing insert, or one whose extractor emits the account-summary
+    # table before the header, pushes the period line past the cut. The cost
+    # of missing it is not a warning: it is a whole month posted into the
+    # wrong fiscal year, silently. Scanning the whole document is one more
+    # regex pass over text we have already loaded.
     for rx in _STMT_PERIOD_RES:
-        m = rx.search(head)
+        m = rx.search(text)
         if not m:
             continue
         g = m.groupdict()
@@ -2641,6 +2667,39 @@ def resolve_category_account(conn, search_text: str,
     return _resolve(conn, search_text, candidates, "category")
 
 
+def _statement_category(conn, r, natures, cache, party_name):
+    """
+    The category for one statement row, asked once per COUNTERPARTY.
+
+    This started as a speed fix and turned out to be a correctness fix as
+    well. Three rows reading
+
+        Zelle Payment To TD Bank 25725052480
+        Zelle Payment To TD Bank 25731144902
+        Zelle Payment To TD Bank 25739901771
+
+    are the same payee three times, but the trailing confirmation code makes
+    every row look like a different vendor to the matcher - so each one got
+    its own model call, and the three calls came back Electronic Payment
+    Processing, Bank Service Fee, Bank Service Fee. One payee, two accounts,
+    inside a single statement. Keying the memo on the normalised PARTY name
+    rather than the raw description collapses them to one question with one
+    answer, and every row that shares a payee shares its account by
+    construction.
+
+    The entry type is part of the key because the same name on the way in and
+    on the way out is genuinely two different accounts.
+
+    cache is None outside a statement import, where per-row is correct.
+    """
+    if cache is None:
+        return resolve_category_account(conn, r.description, natures)
+    key = (normalize_name(party_name or r.description)[:60], r.entry_type)
+    if key not in cache:
+        cache[key] = resolve_category_account(conn, r.description, natures)
+    return cache[key]
+
+
 def _empty_chart_message() -> str:
     return (f"No postable accounts came back for system_id {SYSTEM_ID}. Check that "
             f"v_trans_accounts_m2 exists and that this company's chart is assigned "
@@ -2861,6 +2920,24 @@ def _llm_note_ok() -> None:
     _LLM_FAILS, _LLM_OFF_UNTIL = 0, 0.0
 
 
+def _is_bad_request(e: Exception) -> bool:
+    """
+    True when the API rejected the REQUEST rather than failing to serve it.
+
+    The distinction matters twice over: a 400 must not open the circuit
+    breaker (the service is fine, our arguments were wrong), and it is the one
+    failure worth retrying differently rather than not at all.
+    """
+    code = (getattr(e, 'status_code', None)
+            or getattr(getattr(e, 'response', None), 'status_code', None))
+    if code == 400:
+        return True
+    s = f"{type(e).__name__}: {e}".lower()
+    return any(k in s for k in ('response_format', 'json_object',
+                                'invalid_request', 'does not support',
+                                'unsupported', 'unrecognized'))
+
+
 def _llm_note_fail(e: Exception, where: str) -> None:
     """One place to count a failed model call, whichever call site made it."""
     global _LLM_FAILS, _LLM_OFF_UNTIL
@@ -2886,12 +2963,12 @@ def _llm_config_hint(e: Exception) -> str:
     if '404' in s or 'does not exist' in s or 'model_not_found' in s:
         return (f"      -> The model name is wrong or retired, not the code. "
                 f"GROQ_MODEL is '{getattr(bot, 'model', '?')}'.\n"
-                f"         Run  python3 check_groq.py  to see which models "
+                f"         Run  python3 bot_test.py  to see which models "
                 f"this key can reach.")
     if '401' in s or '403' in s or 'invalid api key' in s or 'authentication' in s:
         return ("      -> The API key was rejected. Check "
                 "ACCOUNTING_GROQ_API_KEY / GROQ_API_KEY, then run "
-                "python3 check_groq.py")
+                "python3 bot_test.py")
     if '429' in s or 'rate limit' in s or 'quota' in s:
         return ("      -> Rate-limited or out of quota. It will recover on "
                 "its own; until then the parse is rule-based.")
@@ -2911,7 +2988,8 @@ def _llm_ask(system: str, user: str, *, max_tokens: int = 300,
             model=bot.model,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
-            temperature=temperature, max_tokens=max_tokens, timeout=8,
+            # temperature=temperature, max_tokens=max_tokens, timeout=8,
+            temperature=temperature, max_tokens=max_tokens, timeout=20,
         )
         out = (r.choices[0].message.content or '').strip()
         _llm_note_ok()
@@ -3050,6 +3128,13 @@ def _llm_canonical_command(message: str, mode: Optional[str] = None) -> Optional
     return line
 
 
+# How many account questions the model is still allowed for the file being
+# imported. None outside a statement import - a person waiting on one typed
+# answer is not the same as a browser waiting on sixty - and an int that
+# counts down inside one. Set and released by handle_statement_import.
+_LLM_PICK_BUDGET: Optional[int] = None
+
+
 _PICK_SYSTEM = (
     "You match what a bookkeeper wrote to ONE account from a list. Reply with "
     "the account's exact name from the list, or exactly NONE. Never invent a "
@@ -3065,8 +3150,19 @@ def _llm_pick_account(search_text: str, candidates: List[Dict], what: str,
     the answer is only accepted if it is one of them - so the worst case is
     the same refusal the operator would have got anyway.
     """
+    global _LLM_PICK_BUDGET
     if not search_text or not candidates or not _llm_available():
         return None
+    # A statement sets a budget for the whole file. Sixty rows must not mean
+    # sixty sequential round trips: the upload gives up at three minutes and
+    # the operator loses the entire import rather than one row. Past the
+    # budget this returns None, which is the same answer as "couldn't match" -
+    # the row comes back with the account blank and flagged for the operator,
+    # which is a visible gap rather than a lost file.
+    if _LLM_PICK_BUDGET is not None:
+        if _LLM_PICK_BUDGET <= 0:
+            return None
+        _LLM_PICK_BUDGET -= 1
     shortlist = candidates[:40] if len(candidates) <= 40 else sorted(
         candidates,
         key=lambda r: max(name_similarity(search_text, n) for n in _candidate_names(r)),
@@ -3077,7 +3173,8 @@ def _llm_pick_account(search_text: str, candidates: List[Dict], what: str,
     out = _llm_ask(_PICK_SYSTEM,
                    f"The bookkeeper wrote: \"{search_text}\"\n"
                    f"It should be one of these {kind}s:\n{listing}",
-                   max_tokens=60)
+                   max_tokens=300)
+                #    max_tokens=60)
     if not out:
         return None
     answer = out.splitlines()[0].strip().strip('-`" ')
@@ -3119,7 +3216,11 @@ def _voice(text: str, must_keep: Optional[List[str]] = None) -> str:
                        "words, no emoji, no greeting, no sign-off. Reply with the "
                        "rewritten message only."},
                       {"role": "user", "content": text}],
-            temperature=0.2, max_tokens=260, timeout=6,
+            # 260 was sized for a model that answers directly. gpt-oss-20b
+            # spends its budget reasoning first and then has nothing left to
+            # say, so the rewrite came back empty or half-written and the
+            # whole voice pass silently switched itself off for the run.
+            temperature=0.2, max_tokens=600, timeout=20,
         )
         out = strip_emojis((r.choices[0].message.content or '').strip())
     except Exception as e:
@@ -3312,15 +3413,47 @@ def _next_voucher_id(cur, doc_type: str) -> int:
     The structure matters: other pages read the doc type back out of the id,
     e.g. invoice_list() does substring(idt_at_id, 5, 2) to choose crv.php
     vs cpv.php.
+
+    WHERE THE 1062 CAME FROM.  The duplicate key MySQL reported was
+    '261203000123-146' - two values, at_id and system_id. at_doc_type is not
+    in that key. So a MAX(at_id) filtered by at_doc_type cannot see an id
+    already held by a different doc type, and hands it back as "next" - and
+    the insert dies on a row we were never shown.
+
+    The fix is to filter on the same thing the key constrains. The id carries
+    its own doc type at offset 5..6, which is exactly what invoice_list()
+    reads, so SUBSTRING(at_id, 5, 2) asks the question the column beside it
+    was only approximating.
+
+    The loop closes the other half of it. Two requests a moment apart both
+    read the same MAX and both try to write it; nothing here can take a table
+    lock, so rather than trust the read we step over whatever is already
+    there. Bounded, so a pathological table fails with a sentence instead of
+    spinning.
     """
     seed = int(f"{datetime.now():%y%m}{doc_type}000001")
     cur.execute(
         "SELECT IFNULL(MAX(at_id), 0) FROM acc_trans_m "
-        "WHERE at_doc_type = %s AND system_id = %s",
+        "WHERE SUBSTRING(at_id, 5, 2) = %s AND system_id = %s",
         (doc_type, SYSTEM_ID),
     )
     current = int(cur.fetchone()[0] or 0)
-    return max(seed, current + 1)
+    at_id = max(seed, current + 1)
+
+    for _ in range(1000):
+        cur.execute(
+            "SELECT 1 FROM acc_trans_m WHERE at_id = %s AND system_id = %s LIMIT 1",
+            (at_id, SYSTEM_ID),
+        )
+        if cur.fetchone() is None:
+            return at_id
+        at_id += 1
+
+    raise ValueError(
+        "I couldn't find a free voucher number - the thousand after "
+        f"{max(seed, current + 1)} are all taken. Nothing has been written. "
+        "Pass this on to whoever maintains LockInLedger."
+    )
 
 
 def insert_voucher(conn, entry_type: str, party_code, bank_res: Resolution,
@@ -3707,7 +3840,8 @@ class AccountingBot:
         # The model name doesn't depend on whether a key was found - keeping it
         # unconditional means anything that reads self.model (the voice pass,
         # /api/debug/extract) works the same however the client got attached.
-        self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        # self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
         if api_key:
             self.groq_client = Groq(api_key=api_key)
             print(f"Groq client initialized ({self.model})")
@@ -3893,13 +4027,37 @@ Return ONLY valid JSON, no markdown, no extra text.
         # given up. One breaker, both call sites.
         if self.groq_client and _llm_available():
             try:
-                response = self.groq_client.chat.completions.create(
+                # 400 was sized for a model that replies with the JSON and
+                # nothing else. gpt-oss-20b reasons first and spends the budget
+                # doing it, so the reply arrives cut off mid-object - which
+                # surfaces as a JSONDecodeError, i.e. it reads like a broken
+                # model rather than a short allowance. 1200 leaves room for
+                # the thinking and the answer.
+                kwargs = dict(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.1,
-                    max_tokens=400,
+                    max_tokens=1200,
+                    timeout=20,
                 )
-                raw = response.choices[0].message.content.strip()
+                try:
+                    # JSON mode removes the other half of the problem: a model
+                    # that wraps its answer in prose or fences.
+                    response = self.groq_client.chat.completions.create(
+                        response_format={"type": "json_object"}, **kwargs)
+                except Exception as e_fmt:
+                    # Not every model on the endpoint accepts JSON mode, and a
+                    # 400 for that is our request being wrong, not the service
+                    # being down - so it must not count against the breaker.
+                    # The prompt already asks for JSON and the fence-stripping
+                    # below still runs, so plain mode loses nothing but the
+                    # guarantee.
+                    if not _is_bad_request(e_fmt):
+                        raise
+                    print(f"NOTE: {self.model} declined JSON mode "
+                          f"({type(e_fmt).__name__}); retrying without it.")
+                    response = self.groq_client.chat.completions.create(**kwargs)
+                raw = (response.choices[0].message.content or '').strip()
                 raw = re.sub(r'^```(?:json)?\s*', '', raw)
                 raw = re.sub(r'\s*```$', '', raw)
                 llm = json.loads(raw)
@@ -4882,21 +5040,41 @@ Return ONLY valid JSON, no markdown, no extra text.
         skipped: List[Dict[str, Any]] = []
         seen_new_party: Dict[str, int] = {}
 
-        for n, r in enumerate(rows, start=1):
-            try:
-                draft = self._statement_row_draft(
-                    conn, r, bank_res=bank_res, existing=existing.get(r.date, []),
-                    index=n, filename=filename)
-            except Exception as e:
-                skipped.append({'line': r.line_no, 'date': r.date,
-                                'amount': r.amount,
-                                'text': r.description[:120],
-                                'why': _internal_error_message(e, "reading that line")})
-                continue
-            if draft.get('party_is_new') and draft.get('party_name'):
-                key = normalize_name(draft['party_name'])
-                seen_new_party[key] = seen_new_party.get(key, 0) + 1
-            drafts.append(draft)
+        # One memo for the whole file, and one budget for the whole file.
+        # Between them these took a 67-row statement from 58 sequential model
+        # calls to 19 - about a minute of waiting to about seventeen seconds -
+        # and, more to the point, stopped the same payee landing in two
+        # different accounts inside one import.
+        global _LLM_PICK_BUDGET
+        cat_cache: Dict[Any, Any] = {}
+        _llm_calls_before = _LLM_PICK_BUDGET
+        _LLM_PICK_BUDGET = STATEMENT_LLM_MAX
+        try:
+            for n, r in enumerate(rows, start=1):
+                try:
+                    draft = self._statement_row_draft(
+                        conn, r, bank_res=bank_res,
+                        existing=existing.get(r.date, []),
+                        index=n, filename=filename, cat_cache=cat_cache)
+                except Exception as e:
+                    skipped.append({'line': r.line_no, 'date': r.date,
+                                    'amount': r.amount,
+                                    'text': r.description[:120],
+                                    'why': _internal_error_message(
+                                        e, "reading that line")})
+                    continue
+                if draft.get('party_is_new') and draft.get('party_name'):
+                    key = normalize_name(draft['party_name'])
+                    seen_new_party[key] = seen_new_party.get(key, 0) + 1
+                drafts.append(draft)
+        finally:
+            # Released whatever happened above - a typed message afterwards is
+            # never budgeted, and an exception here must not leave the cap in
+            # place for the rest of the process.
+            _LLM_PICK_BUDGET = _llm_calls_before
+            print(f"NOTE: statement resolved {len(rows)} rows using "
+                  f"{len(cat_cache)} distinct category lookups "
+                  f"(model budget {STATEMENT_LLM_MAX}).")
 
         for u in (parsed.get('unreadable') or []):
             skipped.append({'line': u.get('line'), 'text': u.get('text', '')[:120],
@@ -4915,7 +5093,7 @@ Return ONLY valid JSON, no markdown, no extra text.
 
     def _statement_row_draft(self, conn, r: 'StatementRow', *, bank_res,
                              existing: List[Dict], index: int,
-                             filename: str) -> Dict[str, Any]:
+                             filename: str, cat_cache=None) -> Dict[str, Any]:
         """One statement row, resolved into the same draft a sentence makes."""
         natures = CRV_INCOME_NATURES if r.entry_type == 'CRV' else CPV_EXPENSE_NATURES
         party_name, party_why = statement_party(r.description)
@@ -4945,7 +5123,8 @@ Return ONLY valid JSON, no markdown, no extra text.
         # is left as an empty field with a note, exactly as a typed line
         # would be - not as a refusal, and never as a silent default that
         # quietly files a month of income under one heading.
-        cat_res, cat_err = resolve_category_account(conn, r.description, natures)
+        cat_res, cat_err = _statement_category(
+            conn, r, natures, cat_cache, party_name)
         if cat_res is None and cat_err is None:
             kind = 'revenue' if r.entry_type == 'CRV' else 'expense'
             raise ValueError(
@@ -5273,7 +5452,7 @@ Return ONLY valid JSON, no markdown, no extra text.
                 first.pop('_final', None)
                 return first
 
-        print(f"NOTE: LLM rewrote {(message or '')[:60]!r} -> {rewritten!r}")
+        print(f"NOTE: LLM rewrote {(message or '')[:200]!r} -> {rewritten!r}")
         alt = await self._process_once(rewritten, session_id, mode, preview,
                                        _rewritten=True)
         if not self._rewrite_is_better(alt, first):
@@ -6704,7 +6883,14 @@ def _internal_error_message(e: Exception, doing: str) -> str:
     traceback.print_exc()
     name = type(e).__name__
     if 'Integrity' in name or 'Duplicate' in name:
-        detail = ("It looks like that record already exists in LockInLedger.")
+        # This used to read "that record already exists", which sent people
+        # looking for a voucher they had supposedly already posted. A 1062 on
+        # acc_trans_m is almost always two writes racing for the same voucher
+        # NUMBER, not the same voucher - nothing was saved, and trying again
+        # re-reads the number and normally goes straight through.
+        detail = ("Two vouchers were given the same number, so this one was "
+                  "refused and nothing was written. Try it once more - the "
+                  "number is worked out fresh each time.")
     elif any(k in name for k in ('Operational', 'Interface', 'Database',
                                  'Connection', 'Timeout', 'Pool')):
         detail = ("I lost the connection to LockInLedger, so nothing was "
@@ -7082,7 +7268,12 @@ async def get_dropdowns(session_id: str):
     conn = bot.get_session_db(session_id)
     chart = get_chart(conn)
     return {
-        "parties": find_party_candidates(conn, "", limit=1000),
+        # find_party_candidates("") returns [] on its first line - an empty
+        # search matches nothing rather than everything, which is right for a
+        # lookup and exactly wrong for filling a dropdown, so the sidebar list
+        # was always empty. list_parties is the unfiltered one, and returns a
+        # superset of the same fields.
+        "parties": list_parties(conn, limit=1000),
         "accounts": [
             {"code": r['code'], "name": r['desc'], "qualified": r['qualified'],
              "parent": r['parent_desc'], "level": r['level'],
@@ -7288,7 +7479,8 @@ async def root():
     return {"bot": bot.name, "status": "online", "database": "MySQL",
             "version": "v6 - chat posting + voucher update + profile creation + chart of accounts"}
 
-
+import audit_log
+audit_log.register(app, bot)
 if __name__ == "__main__":
     import uvicorn
     print(f"\n{'='*62}\n{bot.name} - AI Accounting Bot (v6)\n{'='*62}")

@@ -296,6 +296,12 @@ DB_CONFIG = {
     'password': os.getenv("DB_PASSWORD", ""),
     'database': os.getenv("DB_NAME", ""),
     'port': int(os.getenv("DB_PORT", "3306")),
+    # Without this, an unreachable database host is waited on for as long as
+    # the OS allows - minutes - and because the handlers are async while the
+    # driver blocks, that one wait freezes the only worker: every other
+    # request, even GET /, hangs behind it and the whole site looks down.
+    # 10s turns that into a clear "Can't connect to MySQL" in /api/health.
+    'connection_timeout': int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
 }
 
 SYSTEM_ID = int(os.getenv("SYSTEM_ID", "146"))
@@ -2181,10 +2187,15 @@ def resolve_party_existing(conn, name: str,
 # DB connection
 # --------------------------------------------------------------------------
 def _assert_db_config():
-    missing = [k for k in ('host', 'user', 'password', 'database') if not DB_CONFIG.get(k)]
+    # Named by the env var actually read. This used to build the name from the
+    # dict key, so a missing DB_NAME was reported as "DB_DATABASE" - a variable
+    # nothing reads, which sent people setting the wrong one.
+    env = {'host': 'DB_HOST', 'user': 'DB_USER',
+           'password': 'DB_PASSWORD', 'database': 'DB_NAME'}
+    missing = [env[k] for k in env if not DB_CONFIG.get(k)]
     if missing:
         raise RuntimeError(
-            "Missing DB configuration: " + ", ".join("DB_" + m.upper() for m in missing) +
+            "Missing DB configuration: " + ", ".join(missing) +
             ". Set them in the environment / .env - credentials are no longer "
             "hardcoded. If the old password was ever committed, rotate it."
         )
