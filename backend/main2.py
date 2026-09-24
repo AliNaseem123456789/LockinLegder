@@ -724,7 +724,8 @@ _CRV_VERBS = re.compile(
 # time it is part of the account's real name: "on bank of amercia".
 _BANK_WORD = r'(?:the\s+|my\s+|our\s+)?(?:bank|banks|account|acct|a/c|cash)\b'
 _MARKER_RE = re.compile(
-    r'\b(to|from|for|via|through|thru|into|using|out\s+of|by\s+cheque|by\s+check'
+    r'\b(to|from|for|against|towards?|regarding|re|via|through|thru|into|using'
+    r'|out\s+of|by\s+cheque|by\s+check'
     r'|(?:in|on|at|by|with)(?=\s+' + _BANK_WORD + r'))\b',
     re.IGNORECASE)
 
@@ -900,6 +901,60 @@ def _parse_statement_line(msg: str) -> Optional[Dict[str, Any]]:
     return out
 
 
+# The imperative wrapper people put around a transaction: "Create a CRV
+# for ...", "make the CPV to ...", "record a payment of ...", and the tail
+# "... and post the voucher". None of it is part of the transaction, and the
+# LEADING "for" is actively poisonous - it opens the category segment and
+# swallows the amount, so "Create a CRV for 50,000 received from ABC" reads
+# "50,000 received" as the category. The doc word (crv / cpv / receipt /
+# payment) also carries the DIRECTION, so it is captured and handed back.
+_FRAME_VERB = (r'(?:please\s+|kindly\s+)?'
+               r'(?:can\s+you\s+|could\s+you\s+|i\s+(?:want|need|would\s+like)\s+to\s+'
+               r'|i\'?d\s+like\s+to\s+|let\'?s\s+|lets\s+)?'
+               r'(?:create|make|record|post|enter|register|draft|generate|prepare|'
+               r'raise|log|book|do|add)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?(?:new\s+)?')
+_FRAME_DOC = (r'(?P<doc>crv|cpv|receipt\s+voucher|payment\s+voucher|'
+              r'receipt|payment|voucher|entry|transaction)')
+
+# The lead only ever consumes a trailing "for"/"of"/":" - NEVER "to", which
+# introduces the payee on a payment ("Create a CPV to John for salary").
+_VOUCHER_LEAD_RE = re.compile(
+    r'^\s*' + _FRAME_VERB + _FRAME_DOC + r'\b\s*(?:voucher\b\s*)?'
+    r'(?P<lead>for\b\s*|of\b\s*|:\s*|-\s*)?', re.IGNORECASE)
+
+# The tail needs an explicit object (it / this / the CPV / the voucher / …) so
+# a description ending in a stray verb ("... and record keeping") survives.
+_VOUCHER_TAIL_RE = re.compile(
+    r'[\s,;.]+(?:and\s+|then\s+|so\s+|,\s*)?(?:please\s+|kindly\s+)?'
+    r'(?:create|make|post|record|generate|save|enter|do|raise|log|book)\s+'
+    r'(?:it|this|that|the\s+(?:crv|cpv|voucher|receipt|payment|entry)|'
+    r'a\s+(?:crv|cpv|voucher)|(?:crv|cpv|voucher|receipt\s+voucher|payment\s+voucher))'
+    r'\.?\s*$', re.IGNORECASE)
+
+
+def _doc_to_type(doc: str) -> Optional[str]:
+    d = re.sub(r'\s+', ' ', (doc or '').strip().lower())
+    if d == 'crv' or d.startswith('receipt'):
+        return 'CRV'
+    if d == 'cpv' or d.startswith('payment'):
+        return 'CPV'
+    return None                       # "voucher" / "entry" - no direction in it
+
+
+def _strip_voucher_framing(msg: str) -> Tuple[str, Optional[str]]:
+    """('Create a CRV for 50000 received ...') -> ('50000 received ...', 'CRV')."""
+    forced = None
+    m = _VOUCHER_LEAD_RE.match(msg or '')
+    # Only strip when the wrapper actually named a doc that gives direction, or
+    # ate a leading "for"/"of" that would otherwise mis-open the category. A
+    # bare "make a note ..." (no such doc) is left alone.
+    if m and (m.group('lead') or _doc_to_type(m.group('doc'))):
+        forced = _doc_to_type(m.group('doc'))
+        msg = msg[m.end():].lstrip()
+    msg = _VOUCHER_TAIL_RE.sub('', msg).strip()
+    return msg, forced
+
+
 def _rule_based_extract(message: str) -> Dict[str, Any]:
     """
     Parses the documented one-line formats without an LLM. Returns the same
@@ -910,14 +965,26 @@ def _rule_based_extract(message: str) -> Dict[str, Any]:
     if not msg:
         return {"action": "help"}
 
+    # Peel the "Create a CRV for ... and post it" wrapper off first, keeping
+    # the direction it named.
+    msg, forced_type = _strip_voucher_framing(msg)
+    if not msg:
+        return {"action": "help"}
+
     is_cpv = bool(_CPV_VERBS.search(msg))
     is_crv = bool(_CRV_VERBS.search(msg))
     if is_cpv and is_crv:                       # both present: first one wins
         is_cpv = _CPV_VERBS.search(msg).start() < _CRV_VERBS.search(msg).start()
         is_crv = not is_cpv
     if not is_cpv and not is_crv:
-        return _parse_statement_line(msg) or {"action": "help"}
-    entry_type = 'CPV' if is_cpv else 'CRV'
+        # No verb left. If the wrapper named CRV/CPV, that IS the direction
+        # ("Create a CPV to John for salary"); otherwise try the statement form.
+        if forced_type:
+            is_cpv, is_crv = forced_type == 'CPV', forced_type == 'CRV'
+        else:
+            return _parse_statement_line(msg) or {"action": "help"}
+    # The doc the person named wins over a stray verb in the description.
+    entry_type = forced_type or ('CPV' if is_cpv else 'CRV')
 
     amount = _parse_amount(msg)
     if amount is None:
@@ -926,13 +993,17 @@ def _rule_based_extract(message: str) -> Dict[str, Any]:
     if entry_type == 'CPV':
         role_of = {'to': 'party', 'from': 'bank', 'via': 'bank', 'through': 'bank',
                    'thru': 'bank', 'using': 'bank', 'out of': 'bank',
-                   'into': 'bank', 'for': 'category',
+                   'into': 'bank', 'for': 'category', 'against': 'category',
+                   'towards': 'category', 'toward': 'category',
+                   'regarding': 'category', 're': 'category',
                    'in': 'bank', 'on': 'bank', 'at': 'bank', 'by': 'bank',
                    'with': 'bank'}
     else:
         role_of = {'from': 'party', 'via': 'bank', 'through': 'bank',
                    'thru': 'bank', 'into': 'bank', 'to': 'bank',
                    'using': 'bank', 'out of': 'bank', 'for': 'category',
+                   'against': 'category', 'towards': 'category',
+                   'toward': 'category', 'regarding': 'category', 're': 'category',
                    'in': 'bank', 'on': 'bank', 'at': 'bank', 'by': 'bank',
                    'with': 'bank'}
 
@@ -947,6 +1018,10 @@ def _rule_based_extract(message: str) -> Dict[str, Any]:
         word = re.sub(r'\s+', ' ', m.group(1).lower())
         role = role_of.get(word)
         if role is None or role in filled:
+            continue
+        # "for $50" / "for 50,000" is the amount, not a category - a "for"
+        # immediately followed by a number never opens the category segment.
+        if role == 'category' and re.match(r'\s*[\$£€]?\s*\d', msg[m.end():]):
             continue
         if open_role is not None:
             filled[open_role] = _clean_segment(msg[open_at:m.start()])
@@ -1476,6 +1551,20 @@ def statement_is_transfer(description: str) -> bool:
     return bool(_STMT_TRANSFER_RE.search(description or ''))
 
 
+# A message that starts with one of these is an instruction, whatever else it
+# contains. Used to switch off the intent-keyword shortcuts, which are plain
+# substring tests and will otherwise take a command apart for a word sitting
+# inside one of its values ("report", "summary", "list", "help").
+#
+# `show`, `view` and `list` are deliberately NOT here: they are how the lookup
+# commands themselves begin.
+_COMMAND_LEAD_RE = re.compile(
+    r'^\s*(?:update|edit|change|modify|amend|correct|fix|set|bulk\s+edit'
+    r'|void|cancel|reverse|kill'
+    r'|add|new|create|register|make|setup|set\s+up'
+    r'|rename|deactivate|activate|retire|restore)\b', re.IGNORECASE)
+
+
 def _looks_transactional(message: str) -> bool:
     """Has a direction word AND a number - used to stop the intent keyword
     shortcuts from hijacking a real posting (e.g. 'report' in a description)."""
@@ -1618,7 +1707,31 @@ _VOID_CMD_RE = re.compile(
     r'(?:voucher\s+|entry\s+)?' + _VID + r'\s*$', re.IGNORECASE)
 
 # field keyword -> canonical name
+#
+# The same field under every name a bookkeeper has for it. The chart calls the
+# income/expense leg an ACCOUNT; the panel calls it CATEGORY; people say both
+# in the same sentence. They are one field, and both names have to reach it -
+# "set the income account to Consulting Income" and "change category to
+# Consulting Income" are the same instruction, not two grammars.
+#
+# Multi-word keys are listed here rather than handled as a special case. The
+# alternation below is built longest-first, so "income account" is tried
+# before "income" and the noun is not left stranded at the front of the value
+# (which is what used to turn "income account Consulting" into a category of
+# "account Consulting" - a name that matches nothing).
 _UPD_FIELD_MAP = {
+    'income account': 'category', 'expense account': 'category',
+    'revenue account': 'category', 'category account': 'category',
+    'income acct': 'category', 'expense acct': 'category',
+    'gl account': 'category', 'ledger account': 'category',
+    'chart account': 'category', 'account head': 'category',
+    'income head': 'category', 'expense head': 'category',
+    'expense type': 'category', 'income type': 'category',
+    'bank account': 'bank', 'cash account': 'bank', 'bank acct': 'bank',
+    'party name': 'party', 'customer name': 'party', 'vendor name': 'party',
+    'payee name': 'party', 'supplier name': 'party',
+    'cheque no': 'cheque_no', 'check no': 'cheque_no',
+    'cheque number': 'cheque_no', 'check number': 'cheque_no',
     'amount': 'amount', 'amt': 'amount', 'value': 'amount', 'total': 'amount',
     'date': 'transaction_date', 'dated': 'transaction_date',
     'party': 'party', 'customer': 'party', 'vendor': 'party',
@@ -1640,11 +1753,24 @@ _UPD_FIELD_MAP = {
 # the label, not the value - but only when a connector follows it, or "note
 # number of items" would lose its first word. Longest alternative first, so the
 # filler form is tried before the plain one.
+#
+# The connector-less forms people actually type - "income account Consulting
+# Income", "bank account 9523" - are handled by the multi-word KEYS above
+# instead of by a looser filler rule here, so "category accounts receivable"
+# keeps its first word: "accounts receivable" is the value, not a label.
+#
+# Spaces inside a key become \s+ so "income  account" and a line broken across
+# two spaces read the same as "income account".
+_UPD_FIELD_ALT = '|'.join(
+    re.escape(k).replace(r'\ ', r'\s+')
+    for k in sorted(_UPD_FIELD_MAP, key=len, reverse=True))
 _UPD_FIELD_RE = re.compile(
-    r'\b(' + '|'.join(sorted(_UPD_FIELD_MAP, key=len, reverse=True)) + r')\b'
+    r'\b(' + _UPD_FIELD_ALT + r')\b'
     r'(?:'
     r'\s+(?:name|no\.?|number|account|acct|field|value|head)\s*(?:to|as|into|=|:)\s*'
-    r'|\s*(?:to|as|into|=|:)?\s*'
+    # A trailing full stop belongs to the label, not the value: "cheque no.
+    # 4521" was reading the number as ". 4521", and then as nothing at all.
+    r'|\s*\.?\s*(?:to|as|into|=|:)?\s*'
     r')', re.IGNORECASE)
 
 # Short fields whose value ends at its own natural boundary. Anything after it
@@ -1679,7 +1805,9 @@ def _scan_update_fields(rest: str) -> Dict[str, str]:
         mk = _UPD_FIELD_RE.search(rest, pos)
         if not mk:
             break
-        key = _UPD_FIELD_MAP[mk.group(1).lower()]
+        # The keys are matched with \s+ between their words, so what comes back
+        # can carry whatever spacing was typed. Collapse it before the lookup.
+        key = _UPD_FIELD_MAP[' '.join(mk.group(1).lower().split())]
         vstart = mk.end()
         short = _UPD_SHORT_VALUE.get(key)
         vm = short.match(rest, vstart) if short else None
@@ -1734,12 +1862,19 @@ _BULK_LEAD_DATE_RE = re.compile(
     r'(?:update|edit|change|modify|amend|correct|fix|set)\s+'
     r'(?P<rest>.+?)$', re.IGNORECASE | re.DOTALL)
 
+# The noun ("vouchers", "entries") is OPTIONAL. People write
+# "change category to wholesale on 7-june-2026" far more often than they
+# write the full "...for all vouchers on 7-june-2026", and the short form
+# used to match nothing at all - falling through to the voucher parser,
+# which reported a posting with no amount. What keeps a real posting out of
+# here is the LEADING VERB: a line that starts with Paid or Received can
+# never reach this pattern.
 _BULK_TAIL_DATE_RE = re.compile(
     r'^\s*(?:update|edit|change|modify|amend|correct|fix|set|bulk\s+edit)\s+'
     r'(?P<rest>.+?)\s+'
     r'(?:for|on|in|across)\s+(?:all\s+|every\s+|the\s+)*'
-    r'(?:vouchers?|entries|entry|transactions?)\s*'
-    r'(?:posted|dated|created|made)?\s*(?:on|for|of|from|dated)?\s*'
+    r'(?:(?:vouchers?|entries|entry|transactions?)\s*'
+    r'(?:posted|dated|created|made)?\s*(?:on|for|of|from|dated)?\s*)?'
     r'(?P<date>' + _DATE_TOKEN + r')\s*$', re.IGNORECASE)
 
 _BULK_TAIL_RE = re.compile(_BULK_TAIL, re.IGNORECASE)
@@ -1764,6 +1899,21 @@ def _parse_bulk_update_command(msg: str) -> Optional[Dict[str, Any]]:
         # without this, "name to 3S for all" sets the party to "3S for all".
         rest = _BULK_TAIL_RE.sub('', rest).strip(' ,;:-')
         if not rest:
+            return None
+        # A named voucher is a single edit, not a whole day. Without this,
+        # "change 260902000001 category Printing on 7-june-2026" would ignore
+        # the id and rewrite every voucher on that date.
+        if re.match(r'^\s*(?:crv|cpv)?[\s\-]?\d{8,20}\b', rest):
+            return None
+        # "Edit vouchers on 7-june-2026" names no field at all - the only word
+        # left is the noun itself. That is a request to SEE the day, which the
+        # date parser below handles, not to rewrite it; letting it through here
+        # answered a perfectly good command with "I couldn't see a field name
+        # in 'vouchers'". (Fallout from making the noun optional: it can now
+        # land in `rest` instead of being consumed by the pattern.)
+        if re.fullmatch(r'(?:the\s+|all\s+|every\s+)*'
+                        r'(?:vouchers?|entries|entry|transactions?)',
+                        rest, re.IGNORECASE):
             return None
         fields = _scan_update_fields(rest)
         if not fields:
@@ -2060,10 +2210,19 @@ def _parse_chart_command(msg: str) -> Optional[Dict[str, Any]]:
     return {"nature": nature}
 
 
+# "category" is a synonym for "account" here, and has to be, because it is the
+# word this app uses everywhere else: the panel labels the income/expense leg
+# CATEGORY, the edit grammar takes "change category to X", and the suggestions
+# offered when a category doesn't exist yet say "create the category". A
+# person who is told to create a category and then finds that only "account"
+# works has been given a command that doesn't run.
+#
+# No ambiguity with a profile: "add customer ABC" carries neither word, and
+# "category" is not one of the profile kinds.
 _ADD_ACCOUNT_RE = re.compile(
     r'^\s*(?:add|create|new|make)\s+(?:a\s+|an\s+)?'
     r'(?:(?P<kind>asset|liabilit\w*|equity|revenue|income|expense\w*|cogs|bank)\s+)?'
-    r'(?:gl\s+|ledger\s+|chart\s+)?account\s+'
+    r'(?:gl\s+|ledger\s+|chart\s+)?(?:accounts?|categor(?:y|ies)|head)\s+'
     r'(?P<rest>.+)$', re.IGNORECASE | re.DOTALL)
 _UNDER_RE = re.compile(r'\s+(?:under|below|beneath|in|inside)\s+(?P<parent>.+)$',
                        re.IGNORECASE | re.DOTALL)
@@ -2675,7 +2834,19 @@ def resolve_category_account(conn, search_text: str,
         return None, None
     if not search_text or not search_text.strip():
         return None, ""
-    return _resolve(conn, search_text, candidates, "category")
+    res, err = _resolve(conn, search_text, candidates, "category")
+    if res:
+        return res, err
+    # _resolve has already tried exact, substring, fuzzy AND the language
+    # model (when it is reachable). Only if all of that came up empty does the
+    # deterministic concept net get a turn - "monthly salary" -> the one
+    # salary/wages account. Scored 0.8 on purpose: a real match, but flagged
+    # as a guess in the panel so the operator sees what it settled on.
+    syn = _synonym_match(search_text, candidates)
+    if syn and transactionable_account(conn, syn['code']):
+        print(f"NOTE: concept-matched {search_text!r} -> {syn['qualified']}")
+        return Resolution(syn, 'synonym', 0.8), None
+    return res, err
 
 
 def _statement_category(conn, r, natures, cache, party_name):
@@ -2788,6 +2959,339 @@ def _sample_accounts(conn, natures: set, limit: int = 3) -> List[str]:
     return names[:limit]
 
 
+# ==========================================================================
+# When the category doesn't exist yet
+#
+# "for the company's monthly health insurance premium" against a chart that
+# has Insurance Expense but no health insurance. The matcher scores that pair
+# at 0.507 - under the 0.72 threshold, and barely ahead of Repair and
+# Maintenance at 0.412 - because SequenceMatcher compares character runs and
+# the only real signal here is one shared WORD.
+#
+# So the suggestions are built on words instead. This scorer NEVER decides
+# what goes in a draft: the account that gets filled in is still chosen by
+# _match_account and _llm_pick_account exactly as before. All of this only
+# decides what to OFFER alongside it, which is why widening it cannot put
+# money anywhere new.
+# ==========================================================================
+
+# Words that appear in half the chart, or in every description of a payment,
+# and so carry no information about which account is meant.
+_CAT_NOISE = frozenset("""
+the a an and or of for to from with our my this that these those
+company companys company's business
+monthly annual annually yearly quarterly weekly daily
+premium premiums payment payments pay paid bill bills billed invoice invoiced
+expense expenses expence cost costs charge charges fee fees dues
+account accounts acct gl ledger chart category categories head heads
+general misc miscellaneous other others new
+""".split())
+
+
+def _cat_word(w: str) -> str:
+    """
+    One word, flattened for comparison. The apostrophe matters: normalize_name
+    turns "company's" into "company s", which matches nothing in the noise
+    list, so every proposed name came back as "Company's Health Insurance".
+    """
+    return normalize_name(w).replace(' ', '')
+
+
+def _significant_words(text: str) -> set:
+    """The words in a phrase that actually name something."""
+    return {c for c in (_cat_word(w) for w in re.split(r'[\s/,;]+', text or ''))
+            if len(c) > 2 and c not in _CAT_NOISE and not c.isdigit()}
+
+
+# ==========================================================================
+# The one thing character similarity can't do: know that "salary" and "wages"
+# are the same account.
+#
+# "his monthly salary" shares no letters worth counting with "Salaries and
+# Wages" or "Staff Payroll", so the fuzzy matcher scores it near zero and the
+# operator is left picking from a list. A language model bridges that gap in
+# one call - and it is still the best tool for it, so it runs first whenever
+# it is reachable (see _llm_pick_account). This map is the DETERMINISTIC net
+# under it: a small dictionary of the concepts a bookkeeper's chart is built
+# from, so the commonest intent->account jumps work with the model switched
+# off too. It is not a thesaurus and does not try to be - the model covers
+# the long tail; this covers the everyday.
+#
+# No vector database. A tenant has dozens of categories, not millions, so the
+# whole list fits in one prompt for the model and one dictionary lookup here.
+# A vector store earns its place at a scale this problem never reaches.
+_CONCEPT_SYNONYMS = {
+    'payroll': {'salary', 'salaries', 'salaried', 'wage', 'wages', 'payroll',
+                'remuneration', 'stipend', 'compensation', 'pay', 'payslip',
+                'staffcost', 'staffcosts', 'staffsalary', 'employeesalary',
+                'employeepay', 'staffpay'},
+    'rent': {'rent', 'rents', 'rental', 'rentals', 'lease', 'leases', 'leasing'},
+    'fuel': {'fuel', 'petrol', 'diesel', 'gasoline', 'mileage'},
+    'utilities': {'utility', 'utilities', 'electricity', 'electric', 'power',
+                  'water', 'sewer', 'sewerage'},
+    'insurance': {'insurance', 'insurances', 'premium', 'premiums', 'coverage'},
+    'maintenance': {'repair', 'repairs', 'maintenance', 'servicing', 'upkeep',
+                    'refurbishment'},
+    'supplies': {'supplies', 'supply', 'stationery', 'stationary', 'consumables'},
+    'telephone': {'telephone', 'phone', 'mobile', 'cellphone', 'landline',
+                  'internet', 'broadband', 'communication', 'communications'},
+    'travel': {'travel', 'travelling', 'traveling', 'airfare', 'flight',
+               'flights', 'taxi', 'transport', 'transportation', 'conveyance'},
+    'meals': {'meal', 'meals', 'catering', 'refreshment', 'refreshments',
+              'entertainment'},
+    'marketing': {'marketing', 'advertising', 'advertisement', 'advertisements',
+                  'promotion', 'promotional', 'ads', 'publicity'},
+    'legal': {'legal', 'lawyer', 'attorney', 'solicitor', 'litigation'},
+    'accounting': {'accounting', 'accountancy', 'bookkeeping', 'audit',
+                   'auditing', 'auditor'},
+    'consulting': {'consulting', 'consultancy', 'consultant', 'advisory'},
+    'commission': {'commission', 'commissions', 'brokerage'},
+    'freight': {'freight', 'shipping', 'delivery', 'courier', 'postage',
+                'carriage', 'logistics'},
+    'training': {'training', 'course', 'courses', 'seminar', 'workshop',
+                 'tuition'},
+    'bankcharges': {'bankcharge', 'bankcharges', 'bankfee', 'bankfees',
+                    'servicecharge'},
+    'donation': {'donation', 'donations', 'charity', 'charitable'},
+    'sales': {'sales', 'turnover', 'takings'},
+    'consultingincome': {'consultingincome', 'servicerevenue', 'servicefee',
+                         'servicefees'},
+    'interestincome': {'interestincome', 'interestearned', 'markupincome'},
+}
+# word -> the concept it belongs to.
+_CONCEPT_OF = {w: concept for concept, words in _CONCEPT_SYNONYMS.items()
+               for w in words}
+
+
+def _concept_tokens(text: str) -> set:
+    """
+    The concepts a phrase names, and ONLY those - an unknown word is dropped,
+    not kept. So "his monthly salary" -> {payroll} and "outstanding payment"
+    -> {} (nothing here is a known concept). This is what lets a synonym match
+    fire on "salary" == "wages" without also firing on every shared filler
+    word, which is the general matcher's job.
+    """
+    out = set()
+    for w in re.split(r'[\s/,;]+', text or ''):
+        concept = _CONCEPT_OF.get(_cat_word(w))
+        if concept:
+            out.add(concept)
+    return out
+
+
+def _synonym_match(search_text: str,
+                   candidates: List[Dict]) -> Optional[Dict]:
+    """
+    The account whose NAME names the same concept as the search text, when no
+    characters line up. "monthly salary" -> "Salaries and Wages". Returns a
+    row only when exactly one account wins, because picking the wrong salary
+    account is worse than asking - a tie falls through to the panel.
+    """
+    q = _concept_tokens(search_text)
+    if not q:
+        return None
+    scored = []
+    for r in candidates:
+        c = _concept_tokens(r.get('desc') or '') | _concept_tokens(r.get('qualified') or '')
+        overlap = len(q & c)
+        if overlap:
+            scored.append((overlap, len(r.get('desc') or ''), r))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    if len(scored) == 1 or scored[0][0] > scored[1][0]:
+        return scored[0][2]
+    return None                       # a genuine tie - let the operator choose
+
+
+def _word_overlap(a: str, b: str) -> float:
+    """
+    How much of the SHORTER phrase's meaning the longer one covers.
+
+    Deliberately not a symmetric measure. "health insurance premium" has two
+    significant words and "Insurance Expense" has one; dividing by the union
+    would punish the account for being tersely named, which is exactly how
+    real charts are written.
+    """
+    wa, wb = _significant_words(a), _significant_words(b)
+    if not wa or not wb:
+        return 0.0
+    shared = wa & wb
+    if not shared:
+        # A word can be shared as a stem: "insurances" vs "insurance".
+        shared = {x for x in wa if any(x.startswith(y[:5]) or y.startswith(x[:5])
+                                       for y in wb if len(y) > 4 and len(x) > 4)}
+    if not shared:
+        # Last resort: the same concept under a different word - "salary" and
+        # "wages". Only the concept counts here, so the ladder surfaces the
+        # salary accounts for "monthly salary" even with nothing spelled alike.
+        if _concept_tokens(a) & _concept_tokens(b):
+            return len(_concept_tokens(a) & _concept_tokens(b)) / min(len(wa), len(wb))
+    return len(shared) / min(len(wa), len(wb)) if shared else 0.0
+
+
+def _proposed_category_name(search_text: str) -> str:
+    """
+    The name a new category would get: "the company's monthly health insurance
+    premium" -> "Health Insurance".
+
+    Only ever a starting point - it goes into a suggested command the person
+    reads and can edit before sending, never into anything written.
+    """
+    words = [w for w in re.split(r'[\s/,;]+', (search_text or '').strip()) if w]
+    kept = [w for w in words
+            if _cat_word(w) not in _CAT_NOISE and not w.strip('.,').isdigit()]
+    if not kept:                      # "monthly fees" - nothing left to name it
+        kept = words[:3]
+    return title_case_name(' '.join(kept[:3])) or (search_text or '').strip()
+
+
+def _category_suggestions(conn, search_text: str, natures: set,
+                          entry_type: str) -> Dict[str, Any]:
+    """
+    What to offer when a named category resolves weakly or not at all.
+
+    Four rungs, in the order a bookkeeper would think of them:
+
+      close    an account already in the chart that shares a word
+      heading  a heading whose children don't cover this, so add one under it
+      create   a brand-new category at the top level
+      misc     file it under Miscellaneous and move on
+
+    `heading` is only ever offered when adding under it would actually be
+    allowed. Adding a sub under a plain account that already has vouchers
+    posted to it turns that account into a heading and strands them, which
+    add_chart_account refuses by default - so offering it there would be
+    handing over a command the app rejects.
+    """
+    out: Dict[str, Any] = {'close': [], 'heading': None,
+                           'create': _proposed_category_name(search_text),
+                           'misc': None, 'kind': 'income' if entry_type == 'CRV'
+                           else 'expense'}
+    if not search_text or not search_text.strip():
+        return out
+
+    postable = chart_by_nature(conn, natures)
+
+    # --- 1. accounts that share a word -----------------------------------
+    scored = []
+    for r in postable:
+        s = max(_word_overlap(search_text, r['desc']),
+                _word_overlap(search_text, r['qualified']))
+        if s > 0:
+            scored.append((s, name_similarity(search_text, r['desc']), r))
+    scored.sort(key=lambda x: (-x[0], -x[1], len(x[2]['desc'])))
+    out['close'] = [r for _s, _f, r in scored[:3]]
+
+    # --- 2. a heading that covers this, with no child that does -----------
+    #
+    # "Insurance exists, but we don't have health insurance" is the case this
+    # rung is for, so a matching SIBLING is not a reason to skip it - Auto
+    # Insurance and Liability Insurance both being there is precisely why a
+    # health one is missing. What decides it is the DISTINGUISHING word: the
+    # part of what they wrote that the heading itself doesn't already say.
+    # "health insurance" under a heading called "Insurance" distinguishes on
+    # "health", and if no child carries that word, the child is what's
+    # missing rather than the heading.
+    for n in build_chart_tree(conn):
+        if n['nature'] not in natures:
+            continue
+        for m in n['mains']:
+            if not _word_overlap(search_text, m['name']):
+                continue
+            distinguishing = _significant_words(search_text) - _significant_words(m['name'])
+            if not distinguishing:
+                continue          # they named the heading itself, nothing to add
+            if any(distinguishing & _significant_words(s['name']) for s in m['subs']):
+                continue          # a child already covers it; rung 1 offered it
+            if m['postable'] and _main_has_transactions(conn, m['code']) \
+                    and not ALLOW_ORPHANING_POSTED_MAIN:
+                # Adding a sub here would turn this into a heading and strand
+                # the vouchers already posted to it - add_chart_account
+                # refuses that, so offering it would be handing over a command
+                # the app rejects.
+                continue
+            # Their own word order, not alphabetical: "office cleaning
+            # supplies" under a "Supplies" heading is Office Cleaning
+            # Supplies, never Cleaning Office Supplies.
+            keep, seen = [], set()
+            for w in re.split(r'[\s/,;]+', search_text or ''):
+                c = _cat_word(w)
+                if c not in distinguishing or c in seen:
+                    continue
+                seen.add(c)
+                keep.append(w)
+                if len(keep) == 2:
+                    break
+            out['heading'] = {'name': m['name'], 'code': m['code'],
+                              'subs': [s['name'] for s in m['subs'][:4]],
+                              'sub_count': len(m['subs']),
+                              'child': title_case_name(
+                                  ' '.join(keep) + ' ' + m['name'])}
+            break
+        if out['heading']:
+            break
+
+    # --- 3. somewhere to put it that always exists ------------------------
+    for r in postable:
+        if 'miscellaneous' in (r['desc'] or '').lower():
+            out['misc'] = r
+            break
+    return out
+
+
+def _category_help_text(sug: Dict[str, Any], picked: Optional[str] = None) -> str:
+    """The ladder, as the person reads it."""
+    kind = sug['kind']
+    lines: List[str] = []
+    if sug['close'] and not picked:
+        lines.append("Closest in your chart")
+        lines += [f"  {r['qualified']}" for r in sug['close']]
+    elif sug['close'] and len(sug['close']) > 1:
+        lines.append("Or one of these")
+        lines += [f"  {r['qualified']}" for r in sug['close']
+                  if r['qualified'] != picked]
+    if sug['heading']:
+        h = sug['heading']
+        lines += ["",
+                  f"\"{h['name']}\" is a heading with {h['sub_count']} "
+                  f"account{'' if h['sub_count'] == 1 else 's'} under it"
+                  + (f" ({', '.join(h['subs'])})" if h['subs'] else "")
+                  + f", and none of them covers this. Add one:",
+                  f"  add category {h['child']} under {h['name']}"]
+    else:
+        lines += ["", "Don't have it yet? Create the category:",
+                  f"  add {kind} category {sug['create']}"]
+    if sug['misc']:
+        lines += ["", f"Or file it under {sug['misc']['qualified']}."]
+    return "\n".join(lines).strip()
+
+
+def _category_suggestion_lines(msg: str, sug: Dict[str, Any],
+                               entry_type: str) -> List[str]:
+    """
+    The click-to-fill prompts. Their own sentence with a real account swapped
+    in, so sending one posts - plus the create command, which is the one that
+    isn't a voucher and is why the unfinished line is remembered (see
+    _remember_pending).
+    """
+    out: List[str] = []
+    for r in sug['close'][:2]:
+        line = _line_with_category(msg, r['desc'], entry_type)
+        if line not in out:
+            out.append(line)
+    if sug['heading']:
+        h = sug['heading']
+        out.append(f"add category {h['child']} under {h['name']}")
+    else:
+        out.append(f"add {sug['kind']} category {sug['create']}")
+    if sug['misc']:
+        line = _line_with_category(msg, sug['misc']['desc'], entry_type)
+        if line not in out:
+            out.append(line)
+    return out[:4]
+
+
 def _bank_samples(conn, limit: int = 3) -> List[str]:
     rows = [r for r in get_chart(conn) if r['nature'] == NATURE_ASSET]
     names = sorted({r['desc'] for r in rows if r.get('desc')}, key=lambda x: (len(x), x))
@@ -2810,12 +3314,46 @@ def _bank_lead_re(entry_type: Optional[str]) -> re.Pattern:
 
 def _line_with_category(msg: str, account: str,
                         entry_type: Optional[str] = None) -> str:
-    """Their sentence with 'for <account>' inserted where it belongs."""
-    hits = list(_bank_lead_re(entry_type).finditer(msg or ''))
+    """
+    Their sentence with the category REPLACED by a real account name.
+
+    It used to only ever insert, which is right when the line named no
+    category at all and wrong the rest of the time - the commonest case for
+    this function is a line that DID name one and couldn't match it:
+
+        ...for the company's monthly health insurance premium from meezan 1234
+        -> ...for the company's monthly health insurance premium
+           for Insurance Expense from meezan 1234
+
+    Two "for"s, and the parser takes the first one - so the suggested line
+    came back with the same unmatchable category it was offered to fix. The
+    existing "for ..." span is swapped out when there is one, and the insert
+    is kept for when there isn't.
+    """
+    msg = msg or ''
+    bank_at = None
+    hits = list(_bank_lead_re(entry_type).finditer(msg))
     if hits:
-        at = hits[-1].start()
-        return f"{msg[:at]} for {account}{msg[at:]}".strip()
-    return f"{(msg or '').rstrip(' .')} for {account}"
+        bank_at = hits[-1].start()
+
+    # The category span runs from a "for" to whatever ends it: the bank half
+    # of the sentence, a comma, or the end of the line.
+    for m in re.finditer(r'\bfor\b', msg, re.IGNORECASE):
+        if bank_at is not None and m.start() >= bank_at:
+            break
+        # "for $1,245.00" is the amount, not the category - skip a "for" that
+        # is immediately followed by money.
+        if re.match(r'\s*[\$£€]?\s*\d', msg[m.end():]):
+            continue
+        stop = bank_at if bank_at is not None else len(msg)
+        comma = msg.find(',', m.end())
+        if 0 <= comma < stop:
+            stop = comma
+        return f"{msg[:m.start()]}for {account}{msg[stop:]}".strip()
+
+    if bank_at is not None:
+        return f"{msg[:bank_at]} for {account}{msg[bank_at:]}".strip()
+    return f"{msg.rstrip(' .')} for {account}"
 
 
 def _line_with_bank(msg: str, account: str) -> str:
@@ -3047,6 +3585,7 @@ Paid <amount> to <name> for <expense account> from <bank account>
 Received <amount> from <name> for <income account> into <bank account>
 show <voucher id>
 update <voucher id> <field> <value>, <field> <value>
+update <field> <value> for all vouchers on <date>
 void <voucher id>
 <date>
 add customer <name>, email <e>, phone <p>
@@ -3071,6 +3610,15 @@ _FALLBACK_SYSTEM = (
     "message. Never change a number. Never invent an account.\n"
     "- Fix spelling and word order; keep the identifying digits that belong "
     "to an account name (\"Bank of America 9523\").\n"
+    # The field names are listed because the app's parser only knows these
+    # words. A rewrite into "update 260902000001 ledger head Printing" is a
+    # rewrite into nothing.
+    "- The fields an update can name are exactly: amount, date, party, bank, "
+    "category, check, note. The chart's \"income account\" and \"expense "
+    "account\" ARE the category field - write them as category.\n"
+    "- A change that names a DAY instead of a voucher id is the bulk form: "
+    "\"update <field> <value> for all vouchers on <date>\". Use it whenever "
+    "the message gives a date and no id. Keep the date exactly as written.\n"
     "- 'Paid/spent/sent' is money out. 'Received/got/deposit' is money in.\n"
     "- Only a Paid/Received command needs an amount and a direction. If the "
     "message is clearly one of those but says neither, reply UNKNOWN. Every "
@@ -3087,6 +3635,14 @@ _FALLBACK_SYSTEM = (
     "command: void 260902000001\n"
     "message: chnage 260902000001 amt to 500\n"
     "command: update 260902000001 amount 500\n"
+    # The bulk form, three ways of not saying "for all vouchers".
+    "message: chnage catgory to wholesale on 7-june-2026\n"
+    "command: update category wholesale for all vouchers on 7-june-2026\n"
+    "message: set the incom acct to Consulting Income for evry entry "
+    "dated 06/07/2026\n"
+    "command: update category Consulting Income for all vouchers on 06/07/2026\n"
+    "message: 2026-09-04 put everythng under Office Supplies\n"
+    "command: update category Office Supplies for all vouchers on 2026-09-04\n"
     "message: new custmer abc trading llc ph 555-123-4567\n"
     "command: add customer abc trading llc, phone 555-123-4567\n"
     # No amount and no direction anywhere in the next four - they are here so
@@ -3868,25 +4424,105 @@ class AccountingBot:
             self._sessions[session_id] = conn
         return conn
 
+    # The whole of what counts as asking for the manual. Anything else that
+    # merely contains one of these words is a command that needs reading, not
+    # a request for the grammar - see is_help().
+    _HELP_PHRASES = frozenset({
+        'help', 'help me', 'need help', 'some help', 'a help', 'the help',
+        'help please', 'get help', 'show help', 'more help',
+        'commands', 'command list', 'list of commands', 'list commands',
+        'show commands', 'the commands', 'what commands',
+        'options', 'the options', 'what are my options', 'menu', 'the menu',
+        'guide', 'a guide', 'the guide', 'tutorial', 'a tutorial',
+        'instructions', 'the instructions', 'manual', 'the manual',
+        'capabilities', 'your capabilities', 'what are your capabilities',
+        'what can you do', 'what do you do', 'what else can you do',
+        'how do you work', 'how does this work', 'how do i use this',
+        'what can i say', 'what can i do', 'what can i type',
+        'how to use', 'how to use this', 'usage',
+    })
+
     def is_greeting(self, message: str) -> bool:
         greetings = ['hello', 'hi', 'hey', 'greetings', 'good morning',
-                     'good afternoon', 'good evening', 'howdy', 'yo']
-        m = message.lower().strip()
-        return m in greetings or m in [g + '!' for g in greetings]
+                     'good afternoon', 'good evening', 'howdy', 'yo',
+                     'hiya', 'hey there', 'hi there', 'hello there', 'heya',
+                     'morning', 'afternoon', 'evening', 'gm', 'sup',
+                     "what's up", 'whats up', 'hola']
+        m = ' '.join(re.sub(r'[^a-z0-9\s]', ' ', (message or '').lower()).split())
+        return m in greetings
+
+    def get_greeting_response(self) -> Dict:
+        """
+        A greeting is not a request for the manual.
+
+        "hi" used to return the whole eight-section grammar screen, which reads
+        like being handed an instruction sheet for saying hello. A greeting
+        gets a greeting: who I am, the one thing to know (nothing is written
+        until they confirm it), and a single nudge toward the first action -
+        not a catalogue. "help" still gets the full thing.
+        """
+        text = (
+            "Hello - I'm LedgerAssist, the bookkeeping assistant for LockInLedger.\n\n"
+            "Tell me about a receipt or a payment in a sentence and I'll draft "
+            "the voucher for you to check - nothing is written until you "
+            "confirm it in the panel on the right. I can also open and edit "
+            "vouchers, add customers and vendors, and manage the chart of "
+            "accounts.\n\n"
+            "For example:\n"
+            "  Paid $450 to Handy Fix LLC for Repair and Maintenance "
+            "from Bank of America 9523\n\n"
+            "Type \"help\" any time for the full list of what I understand.")
+        return {'status': 'success', 'message': text, 'analysis': text,
+                'confidence': 'high',
+                'suggestions': [
+                    "Paid $450 to Handy Fix LLC for Repair and Maintenance "
+                    "from Bank of America 9523",
+                    "Received $1,250 from ABC Trading for invoice 2045 "
+                    "into Chase Bank 4582",
+                    "show my transactions",
+                ]}
 
     def is_help(self, message: str) -> bool:
-        return any(w in message.lower() for w in
-                   ['help', 'what can you do', 'how do you work', 'capabilities',
-                    'what do you do', 'guide', 'tutorial'])
+        """
+        Did they ask for the manual, or does the word just happen to be in
+        their sentence?
+
+        This was a substring test, and that is why almost anything unusual
+        came back as the help screen. "change category to Helpdesk Fees for
+        all vouchers on 7-june-2026" contains "help", so it was answered with
+        eight sections of grammar - and because 'help' is not an error status,
+        the model fallback never got to look at the message either. A whole-
+        message test instead: help is what they typed, not a word inside what
+        they typed.
+        """
+        m = ' '.join(re.sub(r'[^a-z0-9\s]', ' ', (message or '').lower()).split())
+        if not m:
+            return False
+        for lead in ('please ', 'can you ', 'could you ', 'i need ', 'i want ',
+                     'give me ', 'show me ', 'tell me '):
+            if m.startswith(lead):
+                m = m[len(lead):].strip()
+        for tail in (' please', ' here', ' now'):
+            if m.endswith(tail):
+                m = m[:-len(tail)].strip()
+        return m in self._HELP_PHRASES
+
+    # Whole words, not fragments. As substrings these matched "last" inside
+    # "Lasting", "health" inside "Healthcare Services" and "report" inside
+    # "Reporting Fees" - all of them real account names, so naming one in a
+    # command sent the command somewhere else entirely.
+    _ANALYSIS_RE = re.compile(
+        r'\b(?:financial|analysis|summary|overview|performance|health|report'
+        r'|how\s+am\s+i\s+doing)\b', re.IGNORECASE)
+    _RECORDS_RE = re.compile(
+        r'\b(?:show|view|list|records|transactions|history|last)\b',
+        re.IGNORECASE)
 
     def is_financial_analysis(self, message: str) -> bool:
-        return any(w in message.lower() for w in
-                   ['financial', 'analysis', 'summary', 'overview',
-                    'how am i doing', 'performance', 'health', 'report'])
+        return bool(self._ANALYSIS_RE.search(message or ''))
 
     def is_query_records(self, message: str) -> bool:
-        return any(w in message.lower() for w in
-                   ['show', 'view', 'list', 'records', 'transactions', 'history', 'last'])
+        return bool(self._RECORDS_RE.search(message or ''))
 
     def get_help_response(self) -> Dict:
         text = (
@@ -3942,6 +4578,34 @@ class AccountingBot:
             'full "EXPENSE/Repair and Maintenance" as your reports show it.'
         )
         return {'status': 'help', 'message': text, 'analysis': text, 'confidence': 'high'}
+
+    def unrecognised_response(self, msg: str = '') -> Dict:
+        """
+        What to say when the message isn't a command we know.
+
+        This used to return the whole help screen - eight sections of grammar
+        for someone who typed one stray sentence, which reads like being
+        handed a manual instead of an answer. It also ended the turn: a 'help'
+        status is not an error, so the language-model fallback never got a
+        look at the message. Status 'error' here is what lets that rewrite
+        run, so a misspelled real command still gets understood.
+        """
+        text = (
+            "I didn't catch what you'd like me to do with that.\n\n"
+            "I can record a receipt or payment, open or edit a voucher, "
+            "add or update a customer or vendor, and show or change the "
+            "chart of accounts.\n\n"
+            "Tell me in a sentence what you need, or type \"help\" for the "
+            "full list of what I understand."
+        )
+        return {'status': 'error', 'message': text, 'analysis': text,
+                'confidence': 'low',
+                'suggestions': [
+                    "Paid $450 to Handy Fix LLC for Repair and Maintenance "
+                    "from Bank of America 9523",
+                    "show my transactions",
+                    "show chart",
+                ]}
 
     async def get_financial_analysis(self, session_id: str) -> Dict:
         conn = self.get_session_db(session_id)
@@ -4137,6 +4801,44 @@ Return ONLY valid JSON, no markdown, no extra text.
         log_llm_extraction(extracted, message, session_id)
         return extracted
 
+    # ------------------------------------------------------------------
+    # The sentence they were in the middle of.
+    #
+    # Being told "create the category first" is only useful if the voucher
+    # survives doing it. Clicking "add expense category Health Insurance"
+    # sends a different command, and the line that prompted it - the amount,
+    # the payee, the bank - was gone; they had to type the whole thing again,
+    # which is exactly the moment someone gives up and files it under
+    # Miscellaneous instead.
+    #
+    # So the unfinished line is held per session, in memory, and handed back
+    # the moment the category exists. Nothing is written by any of this: the
+    # line comes back as a prompt to send, not as a voucher.
+    # ------------------------------------------------------------------
+    _PENDING_MAX = 200
+
+    def _remember_pending(self, session_id: Optional[str], msg: str,
+                          entry_type: Optional[str] = None) -> None:
+        if not session_id or not (msg or '').strip():
+            return
+        if not hasattr(self, '_pending'):
+            self._pending: Dict[str, Dict[str, Optional[str]]] = {}
+        # One line per session, and a ceiling on sessions - this is a
+        # convenience, and a convenience must not be able to grow without end
+        # in a process that stays up for weeks.
+        if len(self._pending) > self._PENDING_MAX:
+            self._pending.clear()
+        # The entry type rides along: on a receipt "from" introduces the
+        # payer rather than the bank, and putting the category in the wrong
+        # half of the sentence would hand back a line that no longer parses.
+        self._pending[session_id] = {'msg': msg.strip(), 'entry_type': entry_type}
+
+    def _take_pending(self, session_id: Optional[str]) -> Optional[Dict]:
+        """Read it once. A line that has been offered back is done."""
+        if not session_id:
+            return None
+        return getattr(self, '_pending', {}).pop(session_id, None)
+
     # ---------------- chat handlers for v6 features ----------------
     @staticmethod
     def _voucher_card(v: Dict, extra_note: Optional[str] = None) -> Dict:
@@ -4184,10 +4886,12 @@ Return ONLY valid JSON, no markdown, no extra text.
         })
 
     async def handle_add_account(self, conn, parsed: Dict,
-                                 preview: bool = False) -> Dict:
-        return self._add_account(conn, parsed, preview)
+                                 preview: bool = False,
+                                 session_id: Optional[str] = None) -> Dict:
+        return self._add_account(conn, parsed, preview, session_id)
 
-    def _add_account(self, conn, parsed: Dict, preview: bool = False) -> Dict:
+    def _add_account(self, conn, parsed: Dict, preview: bool = False,
+                     session_id: Optional[str] = None) -> Dict:
         name = parsed['name']
         tree = build_chart_tree(conn)
 
@@ -4274,9 +4978,11 @@ Return ONLY valid JSON, no markdown, no extra text.
             return self._reply(_internal_error_message(e, "adding that account"),
                                'error', _final=True)
 
-        return self._account_created_reply(r, level, parent_code, parent_label)
+        return self._account_created_reply(r, level, parent_code, parent_label,
+                                           session_id)
 
-    def _account_created_reply(self, r, level, parent_code, parent_label) -> Dict:
+    def _account_created_reply(self, r, level, parent_code, parent_label,
+                               session_id: Optional[str] = None) -> Dict:
         kind = 'sub-account' if level == 'sub' else 'account'
         lines = [f"Created {kind} {r['code']} - {r['name']}",
                  f"Under: {parent_label} [{parent_code}]",
@@ -4286,7 +4992,21 @@ Return ONLY valid JSON, no markdown, no extra text.
             lines.append("")
             lines.append(f"\"{parent_label}\" is now a heading and can no longer "
                          f"be posted to directly.")
-        return self._reply("\n".join(lines), action='account_created', card={
+
+        # The voucher they were in the middle of when they were told the
+        # category didn't exist. Handed straight back with the new category
+        # in it, so creating one is a detour rather than a dead end.
+        pending = self._take_pending(session_id)
+        suggestions = []
+        if pending:
+            line = _line_with_category(pending['msg'], r['name'],
+                                       pending.get('entry_type'))
+            lines += ["", "Picking up where you left off - send this to post "
+                          "the entry you were writing:"]
+            suggestions = [line]
+
+        return self._reply("\n".join(lines), action='account_created',
+                           suggestions=suggestions, card={
             "kind": "account", "code": r['code'], "name": r['name'],
             "level": level, "parent_code": parent_code, "parent_name": parent_label,
         })
@@ -5288,7 +6008,7 @@ Return ONLY valid JSON, no markdown, no extra text.
                        party_display, party_type, party_match_type, party_score,
                        bank_res, cat_res, category_matched, cheque_no,
                        description, review_items, extraction_source,
-                       bank_note=None, cat_note=None,
+                       bank_note=None, cat_note=None, cat_guess=None,
                        suggestions=None) -> Dict[str, Any]:
         """
         A resolved but UNWRITTEN voucher, for the operator to confirm.
@@ -5297,6 +6017,13 @@ Return ONLY valid JSON, no markdown, no extra text.
         client can post the draft back by code and the thing that gets written
         is the thing that was shown. Either account leg may be None - that is a
         field the operator still has to pick, not a failure.
+
+        `cat_note` and `cat_guess` are two different states and the difference
+        matters. A NOTE means the field is empty and the reply says so. A GUESS
+        means the field is filled but the match was weak - the reply has to
+        show the account it chose AND say why it is a guess, because the old
+        wording ("but not the expense account") would be flatly untrue next to
+        a panel showing one.
         """
         party_label = "Customer" if entry_type == 'CRV' else "Vendor"
         bank_label = bank_res.qualified if bank_res else '(choose an account)'
@@ -5331,8 +6058,13 @@ Return ONLY valid JSON, no markdown, no extra text.
             'category_account': cat_res.qualified if cat_res else None,
             'category_match_type': cat_res.match_type if cat_res else None,
             'category_matched': category_matched,
-            'category_note': cat_note,
-            'category_note_short': _problem_short(cat_note) if cat_note else None,
+            'category_note': cat_note or cat_guess,
+            'category_note_short': _problem_short(cat_note or cat_guess)
+                                   if (cat_note or cat_guess) else None,
+            # The panel tints a field amber from category_matched; a guessed
+            # account is filled in but must still be tinted, so the flag says
+            # "confidently matched", not "has a value".
+            'category_guessed': bool(cat_guess),
             'cheque_no': cheque_no,
             'description': description,
             'journal_preview': direction,
@@ -5353,6 +6085,8 @@ Return ONLY valid JSON, no markdown, no extra text.
             missing.append(('income account' if entry_type == 'CRV'
                             else 'expense account', cat_note))
 
+        cat_word = 'income account' if entry_type == 'CRV' else 'expense account'
+
         if missing:
             what = ' and the '.join(m[0] for m in missing)
             lines = [f"Almost there - I have ${amount:,.2f} "
@@ -5364,6 +6098,20 @@ Return ONLY valid JSON, no markdown, no extra text.
                 # Repeating the short form here would say the same thing twice.
                 lines += ["", f"{label.capitalize()}", f"  {note}"]
             lines += ["", "Pick them in the panel, or send one of the lines below."]
+        elif cat_guess:
+            # Filled, but on a weak match. Naming the account it chose IS the
+            # message - a warning that doesn't say what it settled on leaves
+            # the person to go and look, which is how a guess gets approved
+            # without being read.
+            lines = [f"${amount:,.2f} "
+                     f"{'from' if entry_type == 'CRV' else 'to'} {party_display} "
+                     f"on {trans_date.strftime('%m/%d/%Y')}. I've put the "
+                     f"{cat_word} against {cat_res.qualified}, but that was a "
+                     f"guess - nothing in your chart really covers it. Nothing "
+                     f"has been written.",
+                     "", str(cat_guess)]
+            lines += ["", "Keep it, pick another in the panel, or send one of "
+                          "the lines below."]
         else:
             lines = [f"Ready to post - ${amount:,.2f} "
                      f"{'from' if entry_type == 'CRV' else 'to'} {party_display}, "
@@ -5496,22 +6244,31 @@ Return ONLY valid JSON, no markdown, no extra text.
                 return await self.handle_void_voucher(conn, mv.group('id'),
                                                       preview)
 
+            # A whole day, before the single-voucher form: that one needs an
+            # id, and a date is not an id, so this would otherwise fall all
+            # the way through to the voucher parser and be reported as a
+            # posting with no amount.
+            #
+            # It also goes before the PROFILE edit, and that order matters.
+            # The profile grammar is the loosest of the three - the kind
+            # ("customer", "vendor") is optional in it, so anything of the
+            # shape "<verb> <words> <field> <value>" matches. "set income
+            # account to Healthcare Services for all vouchers on 7-june-2026"
+            # was being read as an edit to a customer named "income", because
+            # "account" is a profile field too. A date is as specific an
+            # anchor as a voucher id, so the form that names one wins.
+            mb = _parse_bulk_update_command(msg)
+            if mb:
+                return await self.handle_bulk_update(
+                    conn, mb['date'], mb['fields'], mb.get('unparsed_tail'),
+                    preview, msg)
+
             # A profile edit and a voucher edit share the verb; the voucher
             # one is recognised by its id, so it is tried first and this only
             # sees what it didn't take.
             mep = _parse_edit_profile_command(msg)
             if mep and not _UPDATE_CMD_RE.match(msg):
                 return await self.handle_edit_profile(conn, mep, preview, msg)
-
-            # A whole day, before the single-voucher form: that one needs an
-            # id, and a date is not an id, so this would otherwise fall all
-            # the way through to the voucher parser and be reported as a
-            # posting with no amount.
-            mb = _parse_bulk_update_command(msg)
-            if mb:
-                return await self.handle_bulk_update(
-                    conn, mb['date'], mb['fields'], mb.get('unparsed_tail'),
-                    preview, msg)
 
             mu = _UPDATE_CMD_RE.match(msg)
             if mu:
@@ -5545,7 +6302,8 @@ Return ONLY valid JSON, no markdown, no extra text.
             ma = _parse_add_account_command(msg)
             if ma:
                 ma['source_message'] = msg
-                return await self.handle_add_account(conn, ma, preview)
+                return await self.handle_add_account(conn, ma, preview,
+                                                     session_id)
 
             mp = _parse_profile_command(msg)
             if mp:
@@ -5559,11 +6317,23 @@ Return ONLY valid JSON, no markdown, no extra text.
         # the message carries a direction verb AND an amount.
         transactional = _looks_transactional(msg)
 
-        if not msg or (not transactional and (self.is_greeting(msg) or self.is_help(msg))):
+        # A message that OPENS with an edit or create verb is a command whose
+        # grammar we didn't manage to parse - not a question about the
+        # business. "change category to Report Fees for all vouchers on
+        # 7-june-2026" contains "report", and used to be answered with a
+        # profit-and-loss summary. Anything that gets here having started with
+        # one of those verbs is better off falling through to the model, which
+        # is what happens now.
+        commandish = bool(_COMMAND_LEAD_RE.match(msg))
+        shortcut = not transactional and not commandish
+
+        if shortcut and self.is_greeting(msg):
+            return self.get_greeting_response()
+        if not msg or (shortcut and self.is_help(msg)):
             return self.get_help_response()
-        if not transactional and self.is_financial_analysis(msg):
+        if shortcut and self.is_financial_analysis(msg):
             return await self.get_financial_analysis(session_id)
-        if not transactional and self.is_query_records(msg):
+        if shortcut and self.is_query_records(msg):
             m = re.search(r'\d+', msg)
             return await self.get_records(session_id, int(m.group()) if m else 10)
 
@@ -5585,22 +6355,41 @@ Return ONLY valid JSON, no markdown, no extra text.
             return {'status': 'error', 'message': t, 'analysis': t,
                     'confidence': 'low', 'extraction_source': extracted.get('_source')}
         if action == 'unparsed':
-            hint = _diagnose_unparsed(msg)
             # The raw exception is for the log, not for the person - they can't
             # act on a 404 from a model provider. All they need to know is that
             # the flexible reader is off, so plain phrasing is required.
+            offline = ''
             if extracted.get('_llm_error'):
                 print(f"NOTE: LLM unavailable while parsing "
                       f"{msg[:80]!r}: {extracted['_llm_error']}")
-                hint += ("\n\nHeads-up: my language-model reader is offline "
-                         "right now, so I'm only reading the plain phrasing "
-                         "above. Everything else - editing, profiles, the "
-                         "chart of accounts - works normally.")
+                offline = ("\n\nHeads-up: my language-model reader is offline "
+                           "right now, so I'm only reading the plain phrasing "
+                           "above. Everything else - editing, profiles, the "
+                           "chart of accounts - works normally.")
+
+            # The unparsed diagnosis is a posting checklist - "I found a name,
+            # I still need a direction and an amount". That is exactly right
+            # for a line that was TRYING to be a posting, and wrong for a line
+            # that wasn't: "asdf qwerty" got told which parts of a receipt it
+            # was missing. With no digit and no direction word anywhere,
+            # nothing here was ever a posting, so say the plain thing instead.
+            if (not re.search(r'\d', msg)
+                    and not _CPV_VERBS.search(msg)
+                    and not _CRV_VERBS.search(msg)):
+                out = self.unrecognised_response(msg)
+                if offline:
+                    out['message'] += offline
+                    out['analysis'] = out['message']
+                return out
+
+            hint = _diagnose_unparsed(msg) + offline
             return {'status': 'error', 'message': hint, 'analysis': hint,
                     'confidence': 'low',
                     'extraction_source': extracted.get('_source')}
         if action in (None, 'help'):
-            return self.get_help_response()
+            # Not the help screen: they didn't ask for help, they typed
+            # something I couldn't place. See unrecognised_response().
+            return self.unrecognised_response(msg)
         if action == 'financial_analysis':
             return await self.get_financial_analysis(session_id)
         if action == 'query_records':
@@ -5740,16 +6529,59 @@ Return ONLY valid JSON, no markdown, no extra text.
 
             category_matched = cat_res is not None
             cat_note = cat_err if cat_res is None else None
+            cat_guess: Optional[AccountProblem] = None
+            # The ladder, built once and used by every branch below: the close
+            # matches, a heading to add under, a name for a new category, and
+            # Miscellaneous. Costs one pass over the chart already in memory.
+            cat_sug = (_category_suggestions(conn, category_hint, natures, entry_type)
+                       if category_hint else None)
+
+            # ---- A weak match is still a guess -------------------------------
+            #
+            # _resolve hands back an account the MODEL chose with the same
+            # shape as one the matcher was sure of, so category_matched came
+            # out True and nothing was flagged - while the bank leg beside it
+            # flags exactly this case. A health-insurance payment landed on
+            # Insurance Expense and the operator was never told it was a
+            # guess. Same rule both legs now: a pick that isn't exact, by
+            # code, or a default, is shown as a guess with the alternatives.
+            if cat_res is not None and cat_res.match_type not in (
+                    'exact', 'code', 'default', 'substring_number') \
+                    and cat_res.score < 0.90:
+                category_matched = False
+                shared = (_significant_words(category_hint or '')
+                          & _significant_words(cat_res.desc))
+                because = (f"matched on \"{sorted(shared)[0]}\""
+                           if shared else "the closest thing in your chart")
+                cat_guess = AccountProblem(
+                    (f"Chosen because it was {because} - nothing in your chart "
+                     f"is named for this.\n\n"
+                     + _category_help_text(cat_sug, picked=cat_res.qualified)
+                     if cat_sug else
+                     f"Chosen because it was {because}."),
+                    f"Guessed from \"{category_hint}\" - check it")
+
             if cat_res is None and cat_err and not preview:
                 # A named category that matches nothing must never be silently
                 # rerouted somewhere else on a direct post.
                 return _clarify_reply(
                     msg=msg, note=cat_err,
-                    suggestions=[_line_with_category(msg, n, entry_type)
-                                 for n in _sample_accounts(conn, natures, 2)],
+                    suggestions=(_category_suggestion_lines(msg, cat_sug, entry_type)
+                                 if cat_sug else
+                                 [_line_with_category(msg, n, entry_type)
+                                  for n in _sample_accounts(conn, natures, 2)]),
                     amount=amount, party=party_display, entry_type=entry_type,
                     bank=bank_res.qualified if bank_res else None,
                     date=trans_date.isoformat())
+
+            # A named category that resolved to nothing: say what the chart
+            # DOES have, what to create, and where to put it otherwise -
+            # instead of the old "nothing matches, type show chart".
+            if cat_res is None and cat_err and cat_sug:
+                cat_note = AccountProblem(
+                    f"Nothing in your chart matches \"{category_hint}\".\n\n"
+                    + _category_help_text(cat_sug),
+                    f"No category matches \"{category_hint}\"")
             if not cat_res and not cat_err:
                 cat_res, _ = resolve_category_account(
                     conn, f"{party_name} {description}", natures)
@@ -5802,19 +6634,42 @@ Return ONLY valid JSON, no markdown, no extra text.
             if unresolved:
                 need_bank = bank_res is None
                 need_cat = cat_res is None
-                banks = _bank_samples(conn, 2) if need_bank else [None]
-                cats = _sample_accounts(conn, natures, 2) if need_cat else [None]
-                suggestions = []
-                for i in range(max(len(banks), len(cats))):
-                    line = msg
-                    b = banks[min(i, len(banks) - 1)]
-                    c = cats[min(i, len(cats) - 1)]
-                    if b:
-                        line = _line_with_bank(line, b)
-                    if c:
-                        line = _line_with_category(line, c, entry_type)
-                    if line != msg and line not in suggestions:
-                        suggestions.append(line)
+                # When the category is the thing that's missing and we worked
+                # out a ladder for it, those are the lines to offer: the close
+                # matches, and the command that creates what they actually
+                # meant. A list of two arbitrary account names never was.
+                if need_cat and cat_sug and not need_bank:
+                    suggestions = _category_suggestion_lines(msg, cat_sug, entry_type)
+                else:
+                    banks = _bank_samples(conn, 2) if need_bank else [None]
+                    cats = ([r['desc'] for r in cat_sug['close'][:2]]
+                            if need_cat and cat_sug and cat_sug['close']
+                            else (_sample_accounts(conn, natures, 2) if need_cat
+                                  else [None]))
+                    suggestions = []
+                    for i in range(max(len(banks), len(cats))):
+                        line = msg
+                        b = banks[min(i, len(banks) - 1)]
+                        c = cats[min(i, len(cats) - 1)]
+                        if b:
+                            line = _line_with_bank(line, b)
+                        if c:
+                            line = _line_with_category(line, c, entry_type)
+                        if line != msg and line not in suggestions:
+                            suggestions.append(line)
+            elif cat_guess and cat_sug:
+                # Filled on a guess: offer the alternatives and the create
+                # command, so accepting the guess is a choice rather than the
+                # only thing on screen.
+                suggestions = _category_suggestion_lines(msg, cat_sug, entry_type)
+
+            # The category is about to be shown as blank or guessed, and one of
+            # the lines offered creates a category rather than posting this
+            # voucher. Clicking that one would otherwise lose the sentence
+            # entirely, so it is remembered and handed back the moment the
+            # category exists. See _remember_pending / _account_created_reply.
+            if unresolved or cat_guess:
+                self._remember_pending(session_id, msg, entry_type)
 
             # ---- The rules parsed it, but badly ----------------------------
             # A message with a direction word and a number always "parses" -
@@ -5831,7 +6686,7 @@ Return ONLY valid JSON, no markdown, no extra text.
                     category_matched=category_matched, cheque_no=cheque_no,
                     description=description, review_items=review_items,
                     extraction_source=extracted.get('_source'),
-                    bank_note=bank_note, cat_note=cat_note,
+                    bank_note=bank_note, cat_note=cat_note, cat_guess=cat_guess,
                     suggestions=suggestions)
 
             # ---- Post ----
@@ -6059,15 +6914,56 @@ def add_chart_account(conn, level: str, name: str, parent_code: str) -> Dict[str
             parent_label = par['acc_nature_desc']
 
         elif level == 'sub':
+            # The parent lives in TWO tables and they can disagree.
+            #
+            # account_main is the shared, cross-tenant table; account_main_user
+            # is this company's adoption of that code. _next_child_code already
+            # knows the two can drift - real tenant data predates the invariant
+            # that both are written together - and unions them for exactly that
+            # reason. This lookup didn't, so a main that is in this company's
+            # chart, resolves by name, shows in "show chart" and takes postings
+            # was refused with "Account 45009 does not exist" - a sentence that
+            # is false from where the operator sits, because from the view it
+            # plainly does.
+            #
+            # Which row is missing decides what to say and whether to carry on:
+            # no tenant row means it really isn't this company's account; no
+            # shared row means the chart is what it always was and only the
+            # report flags have nowhere to come from - and those are inherited
+            # from the nature anyway.
             cur.execute("SELECT * FROM account_main WHERE acc_main_id = %s", (parent_code,))
             par = cur.fetchone()
-            if not par:
-                raise ValueError(f"Account {parent_code} does not exist.")
-            cur.execute("SELECT 1 FROM account_main_user WHERE acc_main_id = %s "
+            cur.execute("SELECT * FROM account_main_user WHERE acc_main_id = %s "
                         "AND acc_main_system_id = %s", (parent_code, SYSTEM_ID))
-            if not cur.fetchone():
-                raise ValueError(f"\"{par['acc_main_desc']}\" is not part of this "
-                                 f"company's chart.")
+            mine = cur.fetchone()
+
+            label = next((m['name'] for n in tree for m in n['mains']
+                          if m['code'] == parent_code), None)
+            if not mine:
+                if par:
+                    raise ValueError(f"\"{par['acc_main_desc']}\" is not part of this "
+                                     f"company's chart.")
+                raise ValueError(
+                    f"There is no account {parent_code} in this company's chart, "
+                    f"so there is nothing to put \"{name}\" under. Type \"show "
+                    f"chart\" to see the headings you have, or create it at the "
+                    f"top level:\n    add expense category {name}")
+
+            if not par:
+                # Drift: adopted by this company, absent from the shared table.
+                # The new sub is written the same way regardless - the shared
+                # row is only ever read for the flags that say which reports
+                # the account appears on, and a main inherits those from its
+                # nature. Nothing is invented and nothing shared is touched.
+                cur.execute("SELECT * FROM account_nature WHERE acc_nature_id = %s",
+                            (parent_code[:1],))
+                par = cur.fetchone() or {}
+                print(f"NOTE: account_main has no row for {parent_code} "
+                      f"({label or 'unnamed'}) although account_main_user does. "
+                      f"Adding \"{name}\" under it anyway, with report flags "
+                      f"inherited from nature {parent_code[:1]}. Worth repairing "
+                      f"in the host application: /api/debug/account/{parent_code} "
+                      f"shows which table is short a row.")
 
             new_id = _next_child_code(cur, int(parent_code), 'account_sub', 'account_sub_user', 'acc_sub_id')
             flags = {k: par.get(k) for k in _REPORT_FLAGS}
@@ -6092,7 +6988,7 @@ def add_chart_account(conn, level: str, name: str, parent_code: str) -> Dict[str
                 "UPDATE account_main_user SET hasSubAcc = 1 "
                 "WHERE acc_main_id = %s AND acc_main_system_id = %s",
                 (parent_code, SYSTEM_ID))
-            parent_label = par['acc_main_desc']
+            parent_label = par.get('acc_main_desc') or label or parent_code
         else:
             raise ValueError("level must be 'main' or 'sub'.")
 
@@ -7211,7 +8107,8 @@ async def api_commit_account(payload: AccountCommit):
             parent_label = main['name'] if main else parent_code
 
         r = add_chart_account(conn, level, payload.name, parent_code)
-        return bot._account_created_reply(r, level, parent_code, parent_label)
+        return bot._account_created_reply(r, level, parent_code, parent_label,
+                                         payload.session_id)
     except ValueError as e:
         return {"status": "error", "message": str(e), "analysis": str(e),
                 "confidence": "low"}
@@ -7322,6 +8219,81 @@ async def debug_chart(nature: Optional[str] = None, q: Optional[str] = None):
                  "name": r['desc'], "qualified": r['qualified']}
                 for r in rows
             ],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/debug/account/{code}")
+async def debug_account(code: str):
+    """
+    Where one account code actually lives.
+
+    A chart account is two rows - a shared one keyed across every tenant, and
+    this company's adoption of it - and the pair can drift apart in data that
+    predates the code writing both together. When that happens the symptom is
+    an account that resolves, lists and posts perfectly well but can't be
+    built on, so the only useful question is which of the two tables is short
+    a row. This answers it without a database client. It reads; it writes
+    nothing.
+    """
+    code = str(code).strip()
+    conn = get_connection()
+    try:
+        def one(sql, params):
+            try:
+                rows = _fetch_all(conn, sql, params, "debug_account")
+                return rows[0] if rows else None
+            except Exception as e:
+                return {"query_failed": f"{type(e).__name__}: {e}"}
+
+        where = {
+            'account_main': one(
+                "SELECT acc_main_id, acc_main_desc, acc_nature_id, acc_main_status "
+                "FROM account_main WHERE acc_main_id = %s", (code,)),
+            'account_main_user': one(
+                "SELECT acc_main_id, acc_nature_id, acc_main_status, hasSubAcc, "
+                "acc_main_display_status FROM account_main_user "
+                "WHERE acc_main_id = %s AND acc_main_system_id = %s", (code, SYSTEM_ID)),
+            'account_sub': one(
+                "SELECT acc_sub_id, acc_sub_desc, acc_main_id, acc_sub_status "
+                "FROM account_sub WHERE acc_sub_id = %s", (code,)),
+            'account_sub_user': one(
+                "SELECT acc_sub_id, acc_main_id, acc_sub_status, hasAcc, "
+                "acc_sub_display_status FROM account_sub_user "
+                "WHERE acc_sub_id = %s AND acc_sub_system_id = %s", (code, SYSTEM_ID)),
+        }
+        row = find_account(conn, code)
+        tree = build_chart_tree(conn)
+        as_main = next((m for n in tree for m in n['mains'] if m['code'] == code), None)
+        postings = _main_has_transactions(conn, code)
+
+        present = [t for t, r in where.items() if r and 'query_failed' not in r]
+        if len(code) == 5 and 'account_main_user' in present and 'account_main' not in present:
+            verdict = ("This company has adopted main %s but the shared "
+                       "account_main row is missing. Adding a sub under it works "
+                       "(the report flags come from its nature instead); renaming "
+                       "it does not, because the name lives in that shared row."
+                       % code)
+        elif not present:
+            verdict = f"No row anywhere for {code} - it is not a chart account."
+        else:
+            verdict = "In " + " and ".join(present) + "."
+
+        return {
+            "system_id": SYSTEM_ID,
+            "code": code,
+            "level": account_level(code),
+            "tables": where,
+            "in_postable_view": bool(row),
+            "view_row": ({"code": row['code'], "name": row['desc'],
+                          "qualified": row['qualified']} if row else None),
+            "as_heading_in_chart": ({"name": as_main['name'],
+                                     "sub_count": as_main['sub_count'],
+                                     "postable": as_main['postable']}
+                                    if as_main else None),
+            "posted_legs": postings,
+            "verdict": verdict,
         }
     finally:
         conn.close()

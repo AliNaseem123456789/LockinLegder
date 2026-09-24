@@ -59,10 +59,8 @@ import axios from 'axios';
 // referencing it throws at module load, which blanks the whole app. Set the URL
 // from index.html when it differs from the default:
 //     <script>window.__API_BASE_URL__ = "https://ledger.internal:8000";</script>
+// const API_BASE_URL =(typeof window !== 'undefined' && window.__API_BASE_URL__) || 'http://localhost:8000';
 const API_BASE_URL ="https://lockinledgerwebsite.duckdns.org"
-// const API_BASE_URL ="http://51.20.161.161"
-// const API_BASE_URL =
-//   (typeof window !== 'undefined' && window.__API_BASE_URL__) || 'http://localhost:8000';
 
 // -----------------------------------------------------------------------------
 // Design tokens — a neutral enterprise palette, one accent, no gradients.
@@ -88,6 +86,12 @@ const C = {
   violetSoft: '#F5F2FE',
   blue: '#1D6FB8',
   blueSoft: '#EFF6FC',
+  // The assistant's own voice. Every note it writes about a field — a guess,
+  // a default, a profile it will create — is drawn in this gold so it never
+  // reads as a value the operator typed.
+  gold: '#A8791A',
+  goldSoft: '#FBF5E6',
+  goldLine: '#EAD9A6',
 };
 
 const MONO = '"SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace';
@@ -200,13 +204,105 @@ const CopyButton = ({ value, title = 'Copy' }) => (
   <Tooltip title={title}>
     <IconButton
       size="small"
-      onClick={() => navigator.clipboard?.writeText(String(value))}
+      aria-label={title}
+      // copyText, not navigator.clipboard directly - see the comment on it.
+      onClick={() => copyText(value)}
       sx={{ width: 22, height: 22, color: C.inkMute, '&:hover': { color: C.ink } }}
     >
       <ContentCopyIcon sx={{ fontSize: 13 }} />
     </IconButton>
   </Tooltip>
 );
+
+// Put text on the clipboard, on this app's actual deployments.
+//
+// `navigator.clipboard` exists only in a SECURE CONTEXT — https, or localhost.
+// Served from a plain http:// address, which is how this runs until a
+// certificate is in place, the whole `clipboard` object is undefined. Written
+// as `navigator.clipboard?.writeText(t)` that is silent: optional chaining
+// returns undefined, nothing throws, no catch runs, and the button happily
+// shows a tick for a copy that never happened. So the old `document.exec-
+// Command` route is kept as the fallback — deprecated, but it is the one that
+// works on an insecure origin, and it is the only thing standing between
+// "copied" and a lie.
+//
+// Returns whether it actually worked, because the tick is only honest if
+// something checks.
+const copyText = (text) => {
+  const t = String(text ?? '');
+  if (!t) return false;
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      // Fire-and-forget: the promise can still reject (permissions, a
+      // background tab), and that lands in the catch below on the next tick
+      // rather than here - so the execCommand path is tried first when the
+      // API is missing outright, which is the case that actually bites.
+      navigator.clipboard.writeText(t);
+      return true;
+    }
+  } catch { /* fall through */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = t;
+    // Off-screen but still selectable; `readOnly` stops the mobile keyboard.
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0;';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, t.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+};
+
+// The copy button that sits on a suggested prompt.
+//
+// It copies AND it fills the message bar, because those are not competing
+// intentions here: pressing anything on a prompt row means "I want this one".
+// A button that only copied was the one spot on a click-to-fill row where
+// clicking did nothing visible, which reads as a broken row rather than a
+// different feature.
+//
+// It still has to SAY it worked — a clipboard write is invisible, so without
+// the tick people press it, see nothing, and press it again — and the tick is
+// shown only when copyText reports success, never on the strength of having
+// called it.
+const CopyPromptButton = ({ value, size = 24, onPick }) => {
+  const [done, setDone] = useState(false);
+  useEffect(() => {
+    if (!done) return undefined;
+    const t = setTimeout(() => setDone(false), 1400);
+    return () => clearTimeout(t);
+  }, [done]);
+  return (
+    <Tooltip title={done ? 'Copied — and put in the message bar'
+                         : 'Copy this prompt and put it in the message bar'}>
+      <IconButton
+        size="small"
+        aria-label="Copy this prompt"
+        onClick={(e) => {
+          // The row underneath fills the bar too, so the click is allowed to
+          // reach it - but not every caller has a row, so it is done here as
+          // well and the event is stopped to keep it to exactly one fill.
+          e.stopPropagation();
+          if (copyText(value)) setDone(true);
+          onPick?.(value);
+        }}
+        sx={{
+          width: size, height: size, flexShrink: 0, borderRadius: '6px',
+          color: done ? C.ok : C.inkMute,
+          '&:hover': { color: done ? C.ok : C.accent, background: C.accentSoft },
+        }}
+      >
+        {done ? <CheckIcon sx={{ fontSize: 14 }} />
+              : <ContentCopyIcon sx={{ fontSize: 13 }} />}
+      </IconButton>
+    </Tooltip>
+  );
+};
 
 // -----------------------------------------------------------------------------
 // Record cards
@@ -355,7 +451,8 @@ const VoucherCard = ({ card, onCommand, flush }) => {
               <Tooltip title="Copy voucher id">
                 <IconButton
                   size="small"
-                  onClick={() => navigator.clipboard?.writeText(String(v.atId))}
+                  aria-label="Copy voucher id"
+                  onClick={() => copyText(v.atId)}
                   sx={{ width: 18, height: 18, color: '#fff', opacity: 0.6,
                         '&:hover': { opacity: 1, background: 'rgba(255,255,255,0.15)' } }}
                 >
@@ -955,7 +1052,25 @@ const DRAFT_INPUT_SX = {
   '& .MuiInputBase-input': { p: 0 },
 };
 
-const DraftField = ({ label, children, hint, tone }) => (
+// A line the assistant wrote about a field it filled in — a guess it made, a
+// default it chose, a profile it will create when you post. Deliberately
+// unlike a typed value: a spark, italic, its own gold, and a bold label that
+// names what kind of note it is ("AI Reason:", "AI Auto-Note:"). The whole
+// point is that "I worked this out" can never be mistaken for "you entered
+// this".
+const AINote = ({ label = 'Note', children }) => (
+  <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5, mt: 0.45 }}>
+    <AutoAwesomeIcon sx={{ fontSize: 12.5, color: C.gold, mt: '1.5px', flexShrink: 0 }} />
+    <Typography sx={{ fontSize: 11, lineHeight: 1.45, fontStyle: 'italic', color: C.gold }}>
+      <Box component="span" sx={{ fontWeight: 700, fontStyle: 'normal' }}>
+        AI {label}:
+      </Box>{' '}
+      {children}
+    </Typography>
+  </Box>
+);
+
+const DraftField = ({ label, children, hint, tone, aiLabel }) => (
   <Box sx={{ px: 1.75, py: 0.7, borderBottom: `1px solid ${C.line}`, minWidth: 0 }}>
     <Typography
       sx={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '0.07em',
@@ -965,10 +1080,17 @@ const DraftField = ({ label, children, hint, tone }) => (
     </Typography>
     {children}
     {hint ? (
-      <Typography sx={{ fontSize: 10.5, mt: 0.3, lineHeight: 1.4,
-                        color: tone === 'warn' ? C.warn : C.inkMute }}>
-        {hint}
-      </Typography>
+      // A hint the assistant authored (aiLabel set) is drawn as an AI note; a
+      // plain "was …" change indicator stays quiet grey/amber, because it is
+      // the operator's own history, not the assistant's guess.
+      aiLabel ? (
+        <AINote label={aiLabel}>{hint}</AINote>
+      ) : (
+        <Typography sx={{ fontSize: 10.5, mt: 0.3, lineHeight: 1.4,
+                          color: tone === 'warn' ? C.warn : C.inkMute }}>
+          {hint}
+        </Typography>
+      )
     ) : null}
   </Box>
 );
@@ -1280,7 +1402,7 @@ const EditDraftFields = ({ draft, set, pickers, parties }) => {
 // wins - so the panel opens as a plain document you can read in one pass, and
 // the controls only appear when you press Edit.
 // -----------------------------------------------------------------------------
-const PV = ({ label, value, wide, tone, note }) => (
+const PV = ({ label, value, wide, tone, note, ai, aiLabel = 'Note' }) => (
   <Box sx={{ px: 1.75, py: 0.75, minWidth: 0,
              gridColumn: wide ? '1 / -1' : 'auto',
              borderBottom: `1px solid ${C.line}` }}>
@@ -1293,9 +1415,12 @@ const PV = ({ label, value, wide, tone, note }) => (
       {value || '—'}
     </Typography>
     {note ? (
-      <Typography sx={{ fontSize: 10.5, color: C.warn, lineHeight: 1.4 }}>
-        {note}
-      </Typography>
+      // `ai` draws it in the assistant's voice; without it, it stays a plain
+      // "was …" change indicator.
+      ai ? <AINote label={aiLabel}>{note}</AINote>
+         : <Typography sx={{ fontSize: 10.5, color: C.warn, lineHeight: 1.4 }}>
+             {note}
+           </Typography>
     ) : null}
   </Box>
 );
@@ -1368,11 +1493,13 @@ const DraftPreview = ({ draft, kind }) => {
       <PV label="AMOUNT" value={draft.amount === '' || draft.amount == null
         ? '' : `$${money(draft.amount)}`} />
       <PV label={isCRV ? 'RECEIVED FROM' : 'PAY TO'} wide
-          tone={draft.party_is_new ? 'warn' : undefined}
-          value={draft.party_name
-            ? draft.party_name + (draft.party_is_new ? '  (new profile)' : '')
-            : ''} />
+          value={draft.party_name || ''}
+          note={draft.party_is_new ? 'New — created when you post' : undefined}
+          ai aiLabel="Auto-Note" />
       <PV label="BANK / CASH" value={draft.bank_account} wide
+          note={draft.bank_acc_code ? undefined
+            : (draft.bank_note_short || 'Not matched — choose it')}
+          ai aiLabel="Note"
           tone={draft.bank_acc_code ? undefined : 'warn'} />
       {/* An account that was DEFAULTED rather than matched looks identical to
           one that was read off the line, and on a statement most of them are
@@ -1382,6 +1509,7 @@ const DraftPreview = ({ draft, kind }) => {
           value={draft.category_account}
           note={draft.category_acc_code && draft.category_matched === false
             ? (draft.category_note_short || 'Default used') : undefined}
+          ai aiLabel="Reason"
           tone={draft.category_acc_code && draft.category_matched !== false
             ? undefined : 'warn'} />
       <PV label="REFERENCE" value={draft.cheque_no ? `Check #${draft.cheque_no}` : ''} />
@@ -1582,13 +1710,17 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
         // the guesses look mandatory.
         const Group = ({ title, items, strong }) => (
           <>
-            <Typography sx={{ fontSize: 10, color: C.warn, fontWeight: 700,
-                              letterSpacing: '.06em', mb: 0.2, mt: title.mt ? 0.6 : 0 }}>
-              {title.text}
-            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.4,
+                       mb: 0.2, mt: title.mt ? 0.6 : 0 }}>
+              <AutoAwesomeIcon sx={{ fontSize: 12, color: C.gold, flexShrink: 0 }} />
+              <Typography sx={{ fontSize: 10, color: C.warn, fontWeight: 700,
+                                letterSpacing: '.06em' }}>
+                {title.text}
+              </Typography>
+            </Box>
             {items.map((t) => (
               <Typography key={t} sx={{ fontSize: 11.5, color: C.warn,
-                                        lineHeight: 1.4,
+                                        lineHeight: 1.4, pl: 0.2,
                                         fontWeight: strong ? 600 : 400 }}>
                 {isVoid ? t : `• ${t}`}
               </Typography>
@@ -1673,7 +1805,7 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
 
         <DraftField
           label={isCRV ? 'RECEIVED FROM' : 'PAY TO'}
-          tone={draft.party_is_new ? 'warn' : undefined}
+          aiLabel="Auto-Note"
           hint={draft.party_is_new ? 'New — created when you post' : undefined}
         >
           <Autocomplete
@@ -1709,7 +1841,7 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
 
         <DraftField
           label="BANK / CASH"
-          tone={draft.bank_acc_code ? undefined : 'warn'}
+          aiLabel="Note"
           hint={draft.bank_acc_code ? undefined
             : (draft.bank_note_short || 'Not matched — choose it')}
         >
@@ -1728,8 +1860,7 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
 
         <DraftField
           label={isCRV ? 'INCOME ACCOUNT' : 'EXPENSE ACCOUNT'}
-          tone={draft.category_acc_code && draft.category_matched !== false
-            ? undefined : 'warn'}
+          aiLabel="Reason"
           hint={!draft.category_acc_code
             ? (draft.category_note_short || 'Not matched — choose it')
             : (draft.category_matched === false
@@ -2091,27 +2222,16 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
             </Button>
           </Box>
         ) : null}
+        {/* The lines the assistant offers after a refusal. They used to SEND
+            on click, which made them the one list in the app that behaved
+            differently from every other list of prompts. They fill the message
+            bar now, like the rest — one keystroke more, and no surprises. */}
         {msg.suggestions?.length ? (
-          <Box sx={{ mt: 1.1, display: 'flex', flexDirection: 'column',
-                     alignItems: 'flex-start', gap: 0.6 }}>
-            <Typography sx={{ fontSize: 10.5, fontWeight: 700, color: C.inkMute,
-                              letterSpacing: '0.06em' }}>
-              SEND ONE OF THESE
-            </Typography>
+          <Box sx={{ mt: 1.1, border: `1px solid ${C.line}`, borderRadius: '8px',
+                     background: C.surface, py: 0.4 }}>
+            <PromptListHeader />
             {msg.suggestions.map((sug) => (
-              <Box
-                key={sug}
-                onClick={() => onSuggest?.(sug)}
-                sx={{ px: 1.1, py: 0.65, borderRadius: '7px', cursor: 'pointer',
-                      border: `1px solid ${C.line}`, background: C.surface,
-                      maxWidth: '100%',
-                      '&:hover': { borderColor: C.accent, background: C.accentSoft } }}
-              >
-                <Mono sx={{ fontSize: 12, color: C.accent, lineHeight: 1.45,
-                            overflowWrap: 'anywhere' }}>
-                  {sug}
-                </Mono>
-              </Box>
+              <PromptRow key={sug} cmd={sug} onPick={onSuggest} />
             ))}
           </Box>
         ) : null}
@@ -2137,67 +2257,6 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
   );
 };
 
-// -----------------------------------------------------------------------------
-// Reference panel — the command grammar, not a form.
-// -----------------------------------------------------------------------------
-const COMMANDS = [
-  {
-    group: 'Record',
-    items: [
-      'Paid $450 to Handy Fix LLC for Repair and Maintenance from Bank of America 9523 on 06/04/2026',
-      'Received $659.25 from John Smith today via Bank of America 9523 for Healthcare Services',
-      'Paid $780 to Pixel Studio for EXPENSE/Website Development, check 4521',
-      '06/10/2026 Current Assets - ACME OFFICE SUPPLY 129.40 office supplies',
-    ],
-  },
-  {
-    group: 'Review and edit',
-    hint: 'The id can come first or after the verb — both work.',
-    items: [
-      'show 260902000001',
-      '260902000001',
-      'update 260902000001 amount 500',
-      '260902000001 amount 500',
-      '260902000001 update category Printing, date 06/10/2026',
-      'update 260902000001 party Handy Fix LLC, bank Bank of America 9523',
-      'void 260902000001',
-    ],
-  },
-  {
-    group: 'Edit a whole day',
-    hint: 'Give a date instead of an id — tick the vouchers you want, then confirm each one in the preview.',
-    items: [
-      '7-june-2026',
-      '06/07/2026',
-      'vouchers on 7 June 2026',
-      'show vouchers dated 7-jun-26',
-      'edit vouchers today',
-      'update 7-june-2026',
-    ],
-  },
-  {
-    group: 'Profiles',
-    items: [
-      'add vendor Handy Fix LLC, email ops@handyfix.com, phone 555-0143',
-      'new customer Acme Corp',
-      'add employee Maria Lopez, phone 555-0192, title Nurse',
-    ],
-  },
-  {
-    group: 'Chart of accounts',
-    items: [
-      'add expense account Fuel',
-      'add revenue account Consulting Income',
-      'add bank account Meezan 1234',
-      'add account FICA under Payroll Taxes',
-    ],
-  },
-  {
-    group: 'Look up',
-    items: ['show my transactions', 'show my financial summary',
-            'show chart', 'expense chart', 'revenue chart'],
-  },
-];
 
 // -----------------------------------------------------------------------------
 // App
@@ -2205,11 +2264,21 @@ const COMMANDS = [
 // The toolbar. Each button drops the start of a command into the composer and
 // puts the cursor after it, so the button teaches the grammar rather than
 // hiding it — everything here stays typeable.
+//
+// These are the PLACEHOLDER, and nothing else. They used to be printed again
+// on a line under the box, prefixed "For example:" — the same sentence twice,
+// one of them in permanent grey, on the one strip of screen the composer needs
+// for its own suggestions. A placeholder already means "type something like
+// this", and it gets out of the way the moment you do.
+//
+// Written as whole sentences for that reason: a placeholder is read as an
+// example of what to say, so "Edit voucher 261203000165 and change the amount
+// to $500" teaches more than a bare id and an em dash ever did.
 const PLACEHOLDERS = {
   cpv: 'Paid $450 to Handy Fix LLC for repair and maintenance from Bank of America 9523',
   crv: 'Received $1,250 from ABC Trading for invoice 2045 into Chase Bank 4582',
   post: 'Paid $450 to Handy Fix LLC for repair and maintenance from Bank of America 9523',
-  update: '261203000165 amount 500  —  or a date like 7-june-2026 for a whole day',
+  update: 'Edit voucher 261203000165 and change the amount to $500',
   view: 'show my transactions',
   profile: 'Add ABC Trading LLC as a new customer, phone 555-123-4567',
   editprofile: "Change ABC Trading's phone number to 555-987-6543",
@@ -2253,7 +2322,7 @@ const INTRO = {
       + 'account and the date are filled in for you to check if you leave them out.',
   },
   statement: {
-    hue: C.violet, title: 'Attach Statement — CRV and CPV from a PDF',
+    hue: C.violet, title: 'Read a Statement — CRV and CPV from a PDF',
     blurb: 'Attach a bank or credit-card statement. Every line comes back as a '
       + 'draft voucher for you to check — deposits as CRVs, withdrawals as CPVs.',
     examples: [
@@ -2274,10 +2343,13 @@ const INTRO = {
     hue: C.warn, title: 'Edit Voucher',
     blurb: 'Provide a Voucher ID for direct editing, or a date to view daily entries.',
     examples: [
-      ['261203000165', 'Retrieve a voucher record for review and corrections'],
-      ['Edit voucher 261203000165 and change the amount to $500', 'Modify voucher fields (e.g., amount, date, bank, or category).'],
-      ['7-june-2026', "Display all entries for a specific day to select records for modification."],
-      ['Change note to Reviewed for all vouchers on 7-june-2026',
+      ['Edit voucher 261203000165',
+       'Open one voucher for review and correction'],
+      ['Edit voucher 261203000165 and change category to Healthcare Services',
+       'Modify voucher fields (e.g., amount, date, bank, or category).'],
+      ['Edit vouchers dated 7-june-2026',
+       'Display all entries for a specific day to select records for modification.'],
+      ['Edit vouchers dated 7-june-2026 and change the note to Reviewed',
        'One change across a whole day \u2014 still confirmed one at a time.'],
     ],
     hint: 'Modifies only named fields (amount, date, vendor, bank, category, '
@@ -2290,7 +2362,7 @@ const INTRO = {
     examples: [
       ['show my transactions', 'Display the most recent vouchers'],
       ['Show me recent payments', 'Alternative command for retrieving recent entries'],
-      ['7-june-2026', "Display all entries posted on a specific date."],
+      ['Edit vouchers dated 7-june-2026', 'Display all entries posted on a specific date.'],
       ['show my financial summary', 'View breakdown of total income, expenses, and net profit.'],
     ],
     hint: 'Select or enter any Voucher ID from the list to open it directly for editing.',
@@ -2361,6 +2433,168 @@ const INTRO = {
   },
 };
 
+// -----------------------------------------------------------------------------
+// The command grammar, on this side of the wire
+//
+// No dropdown. A list that floats over the composer covers the thing the
+// person is typing into, which is the one piece of screen that must never be
+// covered — so every suggestion now lives inside a message card in the
+// transcript, where it scrolls with the conversation and hides nothing.
+//
+// What stays on this side is the small amount of grammar the composer needs to
+// stop a message that cannot possibly parse, and to finish one that nearly
+// does. Both rules are deliberately narrow: the server is the parser, and
+// anything that even might be a command is sent to it unchanged.
+// -----------------------------------------------------------------------------
+
+// The three words the assistant is built around. Named in the guardrail, so
+// they are kept in one place rather than retyped into the copy.
+const CORE_VERBS = ['Edit voucher', 'Paid', 'Received'];
+
+// A bare voucher id: 8-20 digits, optionally CRV/CPV in front.
+const BARE_ID_RE = /^\s*(?:crv|cpv)?[\s\-#]*(\d{8,20})\s*$/i;
+
+// A bare date, in any of the shapes the server's own date reader takes.
+const BARE_DATE_RE = new RegExp(
+  '^\\s*(?:'
+  + '\\d{1,4}[/\\-.]\\d{1,2}[/\\-.]\\d{1,4}'
+  + '|\\d{1,2}(?:st|nd|rd|th)?[\\s\\-]+'
+    + '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\\s\\-,]+\\d{2,4}'
+  + '|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\\s\\-]+'
+    + '\\d{1,2}(?:st|nd|rd|th)?[\\s\\-,]+\\d{2,4}'
+  + '|today|yesterday'
+  + ')\\s*$', 'i');
+
+// Everything the server can open a message with. This is NOT the parser - it
+// is the "is this even a command?" test that decides whether to send or to
+// offer help, so it errs wide: a verb here only has to be plausible.
+const KNOWN_OPENERS = new RegExp(
+  '^\\s*(?:'
+  + 'paid|pay|spent|sent|gave|purchased|bought|wrote'            // money out
+  + '|received|recieved|got|deposit(?:ed)?|collected|earned'     // money in
+  + '|edit|update|change|modify|amend|correct|fix|set'           // edits
+  + '|void|cancel|reverse|kill'                                  // reversal
+  + '|show|view|open|load|get|display|fetch|list'                // lookups
+  + '|add|new|create|register|make|setup'                        // creation
+  + '|rename|deactivate|activate|retire|restore'                 // chart
+  + '|vouchers?|entries|entry|transactions?'                     // "vouchers on X"
+  + '|expense|revenue|income|asset|chart'                        // "expense chart"
+  + '|help'
+  + ')\\b', 'i');
+
+// Finish a message that is nearly a command.
+//
+// A bare id and a bare date both already work on the server, but they are the
+// two things people type that LOOK like nothing - a row of digits with no verb
+// - and the reply that comes back is easier to trust when the sentence that
+// produced it says what it asked for. So the verb is added here, in the two
+// cases where there is exactly one thing it could be.
+//
+// "dated", not "on": "Edit vouchers on 7-june-2026" is read by the server as
+// the start of a whole-day EDIT, and "dated" is the form that lands on the
+// day listing.
+const normalizeCommand = (raw) => {
+  const text = String(raw || '').trim();
+  const id = text.match(BARE_ID_RE);
+  if (id) return `Edit voucher ${id[1]}`;
+  if (BARE_DATE_RE.test(text)) return `Edit vouchers dated ${text}`;
+  return text;
+};
+
+// The openers again, as bare words, for the near-miss check below.
+const OPENER_WORDS = ('paid pay spent sent gave purchased bought wrote received '
+  + 'recieved got deposit deposited collected earned edit update change modify '
+  + 'amend correct fix set void cancel reverse kill show view open load get '
+  + 'display fetch list add new create register make setup rename deactivate '
+  + 'activate retire restore voucher vouchers entries entry transaction '
+  + 'transactions expense revenue income asset chart help').split(' ');
+
+// Damerau-Levenshtein: like Levenshtein, but swapping two neighbouring
+// letters costs ONE, not two.
+//
+// That difference is the whole point. The commonest typo by far is a
+// transposition - "shwo", "chnage", "recieved" - and plain Levenshtein prices
+// it the same as two unrelated mistakes. Budgeting for two plain edits to let
+// those through also lets "asdf" in, because "asdf" is two plain edits from
+// "add". Pricing a swap at one keeps the real typos and drops the mashing.
+//
+// Only ever run on ONE short word against a fixed list, so the cost is
+// nothing; the length guard keeps it that way.
+const editDistance = (a, b) => {
+  if (Math.abs(a.length - b.length) > 2) return 99;
+  const d = [];
+  for (let i = 0; i <= a.length; i++) d[i] = [i];
+  for (let j = 0; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+  }
+  return d[a.length][b.length];
+};
+
+// Could this be a command at all?
+//
+// The bar is deliberately on the floor, because the cost of the two mistakes
+// is nowhere near equal. Stopping a real command is a feature the person
+// cannot use; sending a bad one costs a round trip and comes back with a
+// perfectly good explanation from the server, which reads far more than this
+// ever will.
+//
+// So three ways through, and only a message that fails all of them is held:
+//
+//   1. a bare id or date          - normalizeCommand has already fixed it
+//   2. a known opener             - the ordinary case
+//   3. a NEAR-MISS opener, or any digit or currency sign anywhere
+//
+// Rule 3 is the one that matters. "chnage catgory to wholesale on 7-june-2026"
+// is a real command with two typos in it, and the server's model fallback
+// rewrites it correctly - so this must not be the thing that stops it. The
+// first word is matched within an edit or two of a real verb, and any message
+// carrying a number is let through regardless, because a number is the one
+// thing a stray sentence almost never has and an accounting command almost
+// always does.
+const looksLikeCommand = (raw) => {
+  const text = String(raw || '').trim();
+  if (!text) return false;
+  if (BARE_ID_RE.test(text) || BARE_DATE_RE.test(text)) return true;
+  if (KNOWN_OPENERS.test(text)) return true;
+  if (/[\d$£€]/.test(text)) return true;
+  const first = (text.toLowerCase().match(/[a-z]+/) || [''])[0];
+  if (first.length < 2) return false;
+  // One edit on a short word, two from five letters up. A swapped pair counts
+  // as one, so "shwo" and "ad" still get through on a budget of one.
+  const allowed = first.length <= 4 ? 1 : 2;
+  return OPENER_WORDS.some((w) => editDistance(first, w) <= allowed);
+};
+
+// The note shown when it doesn't. Not a popup - a message in the transcript,
+// with the three openers as prompts that fill the bar like any other.
+//
+// The id is passed in rather than taken from Date.now(). This message is
+// pushed in the SAME tick as the user's own, and two messages built from the
+// same millisecond get the same React key - which React answers by dropping
+// one of them.
+const guardrailMessage = (typed, id) => ({
+  id,
+  type: 'bot',
+  timestamp: new Date(),
+  isError: false,
+  content:
+    `I couldn’t tell what "${String(typed).slice(0, 60)}" should do.\n\n`
+    + 'Start with one of these three and I’ll understand the rest of the '
+    + 'sentence — amounts, names, dates and accounts can be in any order.',
+  suggestions: [
+    'Paid $450 to Handy Fix LLC for repair and maintenance from Bank of America 9523',
+    'Received $1,250 from ABC Trading for invoice 2045 into Chase Bank 4582',
+    'Edit voucher 261203000165 and change the amount to $500',
+  ],
+});
+
 // The opening screen: one friendly sentence, then the four things people
 // actually come here to do, as cards. Each card is a real command — clicking
 // one runs it, so the first screen is usable rather than decorative.
@@ -2384,14 +2618,12 @@ const QuickExamples = ({ onPick }) => (
   <Box sx={{ mt: 1.25, border: `1px solid ${C.line}`, borderRadius: '12px',
              overflow: 'hidden', background: C.surface }}>
     <Box sx={{ px: 1.75, pt: 1.5, pb: 1 }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.9 }}>
-        <AutoAwesomeIcon sx={{ fontSize: 16, color: C.accent }} />
-        <Typography sx={{ fontSize: 13.5, fontWeight: 700, color: C.ink }}>
-          Quick Examples
-        </Typography>
-      </Box>
+      <Typography sx={{ fontSize: 13.5, fontWeight: 700, color: C.ink,
+                        lineHeight: 1.35 }}>
+        💬 Suggested LedgerAssist Prompts (Click to Use)
+      </Typography>
       <Typography sx={{ fontSize: 11.5, color: C.inkMute, mt: 0.15 }}>
-        Click one to try it, or type your own request below.
+        Click any prompt below to automatically fill the message bar.
       </Typography>
     </Box>
 
@@ -2417,7 +2649,7 @@ const QuickExamples = ({ onPick }) => (
                      background: q.soft, color: q.hue }}>
             <q.Icon sx={{ fontSize: 16 }} />
           </Box>
-          <Box sx={{ minWidth: 0 }}>
+          <Box sx={{ minWidth: 0, flex: 1 }}>
             <Typography sx={{ fontSize: 12.5, fontWeight: 600, color: C.ink,
                               lineHeight: 1.35 }}>
               {q.title}
@@ -2427,6 +2659,7 @@ const QuickExamples = ({ onPick }) => (
               “{q.example}”
             </Typography>
           </Box>
+          <CopyPromptButton value={q.example} onPick={onPick} />
         </Box>
       ))}
     </Box>
@@ -2454,6 +2687,53 @@ const GREETING = {
     + 'What would you like to do today?',
 };
 
+// The heading over a list of prompts. One component, so the opening card and
+// every toolbar card say the same thing in the same words.
+const PromptListHeader = () => (
+  <Box sx={{ px: 1, pt: 0.5, pb: 0.6 }}>
+    <Typography sx={{ fontSize: 12.5, fontWeight: 700, color: C.ink,
+                      lineHeight: 1.35 }}>
+      💬 Suggested LedgerAssist Prompts (Click to Use)
+    </Typography>
+    <Typography sx={{ fontSize: 11, color: C.inkMute, lineHeight: 1.4, mt: 0.15 }}>
+      Click any prompt below to automatically fill the message bar.
+    </Typography>
+  </Box>
+);
+
+// One prompt.
+//
+// The whole row is the target - text, description, clipboard button, the
+// padding between them - because a row that fills the bar when you hit the
+// words and does nothing when you hit the gap is a row that feels broken. The
+// clipboard button does BOTH: it copies and it fills, so pressing it can never
+// be the press that did nothing.
+const PromptRow = ({ cmd, what, hue = C.accent, onPick }) => (
+  <Box
+    role="button"
+    tabIndex={0}
+    onClick={() => onPick?.(cmd)}
+    onKeyDown={(e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onPick?.(cmd); }
+    }}
+    sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75,
+          px: 1, py: 0.6, borderRadius: '6px', cursor: 'pointer',
+          '&:hover': { background: C.raised },
+          '&:focus-visible': { outline: `2px solid ${hue}`, outlineOffset: -2 } }}
+  >
+    <Box sx={{ minWidth: 0, flex: 1 }}>
+      <Mono sx={{ fontSize: 12, color: hue, display: 'block',
+                  overflowWrap: 'anywhere', lineHeight: 1.45 }}>
+        {cmd}
+      </Mono>
+      {what ? (
+        <Typography sx={{ fontSize: 11, color: C.inkMute }}>{what}</Typography>
+      ) : null}
+    </Box>
+    <CopyPromptButton value={cmd} onPick={onPick} />
+  </Box>
+);
+
 // One card, used for the opening message and for every toolbar button.
 const IntroCard = ({ intro, onPick }) => {
   const hue = intro.hue || C.accent;
@@ -2467,20 +2747,14 @@ const IntroCard = ({ intro, onPick }) => {
         </Typography>
         <Typography sx={{ fontSize: 11.5, color: C.inkMute }}>{intro.blurb}</Typography>
       </Box>
+      {/* The prompts themselves, inside the card and nowhere else. Every part
+          of a row fills the message bar - the text, the row, the clipboard
+          button - so there is no wrong place to click. The clipboard button
+          also copies, which is the only thing it does that the row doesn't. */}
       <Box sx={{ px: 1.25, py: 0.6 }}>
+        <PromptListHeader />
         {intro.examples.map(([cmd, what]) => (
-          <Box
-            key={cmd}
-            onClick={() => onPick?.(cmd)}
-            sx={{ px: 1, py: 0.6, borderRadius: '6px', cursor: 'pointer',
-                  '&:hover': { background: C.raised } }}
-          >
-            <Mono sx={{ fontSize: 12, color: hue, display: 'block',
-                        overflowWrap: 'anywhere', lineHeight: 1.45 }}>
-              {cmd}
-            </Mono>
-            <Typography sx={{ fontSize: 11, color: C.inkMute }}>{what}</Typography>
-          </Box>
+          <PromptRow key={cmd} cmd={cmd} what={what} hue={hue} onPick={onPick} />
         ))}
       </Box>
       <Box sx={{ display: 'flex', gap: 1, px: 1.75, py: 1,
@@ -2535,11 +2809,14 @@ const QUICK_ACTIONS = [
 ];
 
 // Things people ask that are not on a button.
+// Every one of these opens with a verb the parser knows, and none of them is
+// a bare id or a bare date — those two are exactly what normalizeCommand has
+// to repair, and a suggestion should never need repairing.
 const MORE_HELP = [
-  'Show me recent payments',
+  'Paid $300 to XYZ Ltd for office supplies from Bank of America 9523',
+  'Received $659.25 from John Smith today into Bank of America 9523',
+  'Edit vouchers dated 7-june-2026',
   'Show my financial summary',
-  'Vouchers on 7-june-2026',
-  'Void 260902000001',
 ];
 
 const QuickActionsPanel = ({ onRun, onPick, mode }) => (
@@ -2603,21 +2880,23 @@ const QuickActionsPanel = ({ onRun, onPick, mode }) => (
           </Typography> */}
         </Box>
         <Typography sx={{ fontSize: 11.5, color: C.inkMute, mb: 0.75 }}>
-          Try asking something like:
+          Click to fill the message bar:
         </Typography>
         {MORE_HELP.map((t) => (
           <Box
             key={t}
             onClick={() => onPick(t)}
-            sx={{ display: 'flex', gap: 0.75, py: 0.4, cursor: 'pointer',
-                  '&:hover .qa-ask': { color: C.accent } }}
+            sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75, py: 0.2,
+                  cursor: 'pointer', '&:hover .qa-ask': { color: C.accent } }}
           >
-            <Box sx={{ width: 4, height: 4, borderRadius: '50%', mt: '7px',
+            <Box sx={{ width: 4, height: 4, borderRadius: '50%', mt: '9px',
                        flexShrink: 0, background: C.lineStrong }} />
             <Typography className="qa-ask"
-                        sx={{ fontSize: 11.5, color: C.inkMid, lineHeight: 1.5 }}>
+                        sx={{ flex: 1, minWidth: 0, fontSize: 11.5, color: C.inkMid,
+                              lineHeight: 1.5, mt: '2px' }}>
               “{t}”
             </Typography>
+            <CopyPromptButton value={t} size={20} onPick={onPick} />
           </Box>
         ))}
       </Box>
@@ -2816,12 +3095,16 @@ export default function App() {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading]);
 
-  const loadIntoComposer = useCallback((text, focusOnly) => {
+  // Every prompt in every card lands here: the text goes into the composer,
+  // the composer takes focus, and the caret sits at the end ready to finish
+  // the sentence. `focusOnly` is a leftover of an older split and is ignored -
+  // a prompt that is put in the bar is always ready to be typed on.
+  const loadIntoComposer = useCallback((text) => {
     setInputMessage(text);
     const el = inputRef.current;
     if (el) {
       el.focus();
-      if (focusOnly) requestAnimationFrame(() => el.setSelectionRange(text.length, text.length));
+      requestAnimationFrame(() => el.setSelectionRange(text.length, text.length));
     }
   }, []);
 
@@ -2975,8 +3258,31 @@ export default function App() {
   }, [pendingStatement, pickers, uploadStatement]);
 
   const sendMessage = async (overrideText) => {
-    const text = (overrideText ?? inputMessage).trim();
-    if (!text || isLoading) return;
+    const typed = (overrideText ?? inputMessage).trim();
+    if (!typed || isLoading) return;
+
+    // Two checks, in this order, before anything leaves the browser.
+    //
+    // First: finish it. A bare voucher id or a bare date gets the verb it was
+    // missing, so what reaches the parser is a sentence rather than a row of
+    // digits — and so the transcript shows what was actually asked.
+    const text = normalizeCommand(typed);
+
+    // Second: stop it, but only if it could not be a command at all. This is
+    // not a second parser — the server reads far more than this test does,
+    // including a misspelling of any of it through the model fallback. It
+    // catches the message that has no verb in it anywhere, which is the one
+    // case where a round trip can only come back as a shrug.
+    if (!looksLikeCommand(text)) {
+      const now = Date.now();
+      setMessages((prev) => [
+        ...prev,
+        { id: now, type: 'user', content: typed, timestamp: new Date() },
+        guardrailMessage(typed, now + 1),
+      ]);
+      setInputMessage('');
+      return;
+    }
 
     setMessages((prev) => [...prev, { id: Date.now(), type: 'user', content: text, timestamp: new Date() }]);
     setInputMessage('');
@@ -3456,7 +3762,7 @@ export default function App() {
               <Box sx={{ maxWidth: 780, mx: 'auto' }}>
                 {messages.map((m) => (
                   <Message key={m.id} msg={m} onCommand={loadIntoComposer}
-                           onSuggest={(t) => sendMessage(t)}
+                           onSuggest={loadIntoComposer}
                            onReopenDraft={reopenDraft} onBulkEdit={bulkEdit}
                            onStatementAccount={retryStatementWithAccount}
                            busy={posting || isLoading} />
@@ -3480,9 +3786,10 @@ export default function App() {
                 px: { xs: 2, md: 4 }, py: 1.5,
               }}
             >
-              {/* One box: what you type, and an example of what to type. The
-                  keyboard hints that used to sit under it told a first-time
-                  user nothing they wanted to know. */}
+              {/* One box, and nothing ever on top of it. The example of what
+                  to type is the placeholder; the suggestions live in the
+                  message cards above, where they scroll with the conversation
+                  and cover nothing. */}
               <Box
                 sx={{
                   maxWidth: 780, mx: 'auto', border: `1px solid ${C.line}`,
@@ -3522,7 +3829,7 @@ export default function App() {
                         sendMessage();
                       }
                     }}
-                    placeholder="Type your request here…"
+                    placeholder={PLACEHOLDERS[mode] || PLACEHOLDERS.post}
                     disabled={isLoading}
                     sx={{
                       '& .MuiInput-root:before, & .MuiInput-root:after': { display: 'none' },
@@ -3559,16 +3866,6 @@ export default function App() {
                     <SendIcon sx={{ fontSize: 18, transform: 'rotate(-20deg)',
                                     ml: '-2px', mt: '1px' }} />
                   </IconButton>
-                </Box>
-                <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75, mt: 0.6,
-                           pl: 3.25, pr: 6 }}>
-                  <LightbulbOutlinedIcon sx={{ fontSize: 14, color: C.warn, flexShrink: 0,
-                                               mt: '1px' }} />
-                  <Typography sx={{ fontSize: 11.5, color: C.inkMute, lineHeight: 1.45,
-                                    overflow: 'hidden', textOverflow: 'ellipsis',
-                                    whiteSpace: 'nowrap' }}>
-                    For example: “{PLACEHOLDERS[mode] || PLACEHOLDERS.post}”
-                  </Typography>
                 </Box>
               </Box>
             </Box>
