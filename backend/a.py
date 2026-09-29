@@ -119,7 +119,6 @@ import re
 import csv
 import json
 import time
-import contextvars
 import traceback
 import unicodedata
 from difflib import SequenceMatcher
@@ -127,7 +126,7 @@ from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict, Any, Tuple, NamedTuple
 
 import mysql.connector
-from fastapi import FastAPI, UploadFile, File, Form, Depends, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
@@ -307,46 +306,6 @@ DB_CONFIG = {
 
 SYSTEM_ID = int(os.getenv("SYSTEM_ID", "146"))
 USER_ID = os.getenv("USER_ID", "86")          # written to at_cr_user (varchar(20))
-
-# --------------------------------------------------------------------------
-# WHICH COMPANY IS THIS REQUEST FOR?
-#
-# The two constants above are the FALLBACK - the single tenant this service
-# was originally built for. Multi-tenant works by putting the company on the
-# REQUEST instead: ai/authorize.php validates the operator's LockInLedger
-# session and signs a short-lived token carrying system_id, and
-# get_ledger_context() verifies that token and parks the value here for the
-# life of the request.
-#
-# A ContextVar, not a global: two companies can be mid-request in the same
-# process at the same time, and a plain global would leak one into the other.
-# Everything below reads _sid() / _uid() rather than the constants.
-#
-# With no token AND REQUIRE_LEDGER_AUTH=0 the fallback applies, so the service
-# behaves EXACTLY as it did before any of this existed. That is deliberate:
-# it lets the refactor ship without waiting for the frontend, and the switch
-# is flipped once the React side sends tokens.
-# --------------------------------------------------------------------------
-_CURRENT_SYSTEM_ID: contextvars.ContextVar = contextvars.ContextVar(
-    'ledger_system_id', default=None)
-_CURRENT_USER_ID: contextvars.ContextVar = contextvars.ContextVar(
-    'ledger_user_id', default=None)
-
-# 1 = every data endpoint demands a valid token. 0 = fall back to the env
-# constants (what the bot did before auth). Flip to 1 when the UI sends tokens.
-REQUIRE_LEDGER_AUTH = os.getenv("REQUIRE_LEDGER_AUTH", "0") == "1"
-
-
-def _sid() -> int:
-    """The company this request belongs to - token first, env fallback."""
-    v = _CURRENT_SYSTEM_ID.get()
-    return int(v) if v not in (None, '') else SYSTEM_ID
-
-
-def _uid() -> str:
-    """The ledger user this request belongs to (stamped on at_cr_user)."""
-    v = _CURRENT_USER_ID.get()
-    return str(v) if v not in (None, '') else USER_ID
 
 DOC_TYPE_CRV = '01'      # Cash Receipt Voucher
 DOC_TYPE_CPV = '02'      # Cash Payment Voucher
@@ -2439,19 +2398,7 @@ _CHART_SQL = """
              acc_main_sort, sub_sort, acc_sort, trans_acc_id
 """
 
-# One cache ENTRY PER COMPANY. This was a single global dict, which is the
-# one bug that multi-tenancy turns from "stale data" into "another company's
-# books": whoever warmed the cache first would have their chart of accounts
-# served to everybody else. Keyed by system_id, it cannot happen.
-_chart_cache: Dict[int, Dict[str, Any]] = {}
-
-
-def _chart_cache_bust(sid: Optional[int] = None) -> None:
-    """Forget the cached chart for one company, or for all of them."""
-    if sid is None:
-        _chart_cache.clear()
-    else:
-        _chart_cache.pop(int(sid), None)
+_chart_cache: Dict[str, Any] = {"rows": None, "at": 0.0}
 
 
 def account_level(code: Any) -> str:
@@ -2479,23 +2426,21 @@ def qualified_name(row: Dict) -> str:
 
 
 def get_chart(conn, force: bool = False) -> List[Dict]:
-    """All postable accounts for _sid(), cached for CHART_CACHE_TTL seconds."""
-    sid = _sid()
+    """All postable accounts for SYSTEM_ID, cached for CHART_CACHE_TTL seconds."""
     now = time.time()
-    entry = _chart_cache.get(sid)
-    if (not force and entry and entry["rows"] is not None
-            and now - entry["at"] < CHART_CACHE_TTL):
-        return entry["rows"]
+    if (not force and _chart_cache["rows"] is not None
+            and now - _chart_cache["at"] < CHART_CACHE_TTL):
+        return _chart_cache["rows"]
 
     cur = conn.cursor()
     try:
-        cur.execute("SET @system_id = %s", (_sid(),))
+        cur.execute("SET @system_id = %s", (SYSTEM_ID,))
     except Exception:
         pass
     finally:
         cur.close()
 
-    rows = _fetch_all(conn, _CHART_SQL, (_sid(),), "get_chart")
+    rows = _fetch_all(conn, _CHART_SQL, (SYSTEM_ID,), "get_chart")
     for r in rows:
         r['code'] = str(r['trans_acc_id'])
         r['desc'] = (r.get('trans_acc_desc') or '').strip()
@@ -2504,7 +2449,8 @@ def get_chart(conn, force: bool = False) -> List[Dict]:
         r['level'] = account_level(r['code'])
         r['nature'] = account_nature(r['code'])
 
-    _chart_cache[sid] = {"rows": rows, "at": now}
+    _chart_cache["rows"] = rows
+    _chart_cache["at"] = now
     return rows
 
 
@@ -2629,7 +2575,7 @@ def transactionable_account(conn, code: Any) -> bool:
     if not sql:
         return True                     # 13-digit individual accounts are always leaves
     cur = conn.cursor()
-    cur.execute(sql, (code, _sid()))
+    cur.execute(sql, (code, SYSTEM_ID))
     has_children = cur.fetchone() is not None
     cur.close()
     return not has_children
@@ -2937,7 +2883,7 @@ def _statement_category(conn, r, natures, cache, party_name):
 
 
 def _empty_chart_message() -> str:
-    return (f"No postable accounts came back for system_id {_sid()}. Check that "
+    return (f"No postable accounts came back for system_id {SYSTEM_ID}. Check that "
             f"v_trans_accounts_m2 exists and that this company's chart is assigned "
             f"in accounts_user / account_sub_user / account_main_user. "
             f"GET /api/debug/chart shows what the view returns.")
@@ -3873,7 +3819,7 @@ def within_open_year(conn, trans_date) -> bool:
     )
     d = trans_date.isoformat() if hasattr(trans_date, 'isoformat') else str(trans_date)
     try:
-        rows = _fetch_all(conn, query, (_sid(), d, d, d, d), "within_open_year")
+        rows = _fetch_all(conn, query, (SYSTEM_ID, d, d, d, d), "within_open_year")
         return bool(rows)
     except Exception as e:
         print(f"Fiscal-year check skipped: {e}")
@@ -3899,17 +3845,17 @@ def find_party_candidates(conn, name: str, p_type: Optional[str] = None,
     queries = [
         (base + type_clause +
          " AND (LOWER(TRIM(company_name))=LOWER(TRIM(%s)) OR LOWER(TRIM(person_name))=LOWER(TRIM(%s)))",
-         (_sid(),) + type_param + (name_stripped, name_stripped)),
+         (SYSTEM_ID,) + type_param + (name_stripped, name_stripped)),
         (base + type_clause + " AND (company_name LIKE %s OR person_name LIKE %s) LIMIT %s",
-         (_sid(),) + type_param + (name_stripped + "%", name_stripped + "%", limit)),
+         (SYSTEM_ID,) + type_param + (name_stripped + "%", name_stripped + "%", limit)),
         (base + type_clause + " AND (company_name LIKE %s OR person_name LIKE %s) LIMIT %s",
-         (_sid(),) + type_param + ("%" + name_stripped + "%", "%" + name_stripped + "%", limit)),
+         (SYSTEM_ID,) + type_param + ("%" + name_stripped + "%", "%" + name_stripped + "%", limit)),
     ]
     first_token = name_stripped.split()[0] if name_stripped.split() else name_stripped
     if len(first_token) >= 3:
         queries.append(
             (base + type_clause + " AND (company_name LIKE %s OR person_name LIKE %s) LIMIT %s",
-             (_sid(),) + type_param + ("%" + first_token + "%", "%" + first_token + "%", limit)))
+             (SYSTEM_ID,) + type_param + ("%" + first_token + "%", "%" + first_token + "%", limit)))
 
     for q, params in queries:
         start = datetime.now()
@@ -3931,7 +3877,7 @@ def _next_party_code(cur, p_type: str) -> str:
     seed = int(PARTY_CODE_PREFIX[p_type] + "00001")
     cur.execute(
         "SELECT IFNULL(MAX(p_code), 0) FROM acc_party WHERE p_type = %s AND system_id = %s",
-        (p_type, _sid()),
+        (p_type, SYSTEM_ID),
     )
     current = int(cur.fetchone()[0] or 0)
     return str(max(seed, current + 1))
@@ -3951,10 +3897,10 @@ def create_party(conn, name: str, p_type: str) -> Tuple[str, str]:
     query = ("INSERT INTO acc_party (p_code, p_type, company_name, person_name, "
              "status, system_id) VALUES (%s, %s, %s, %s, 1, %s)")
     start = datetime.now()
-    cur.execute(query, (new_code, p_type, display_name, display_name, _sid()))
+    cur.execute(query, (new_code, p_type, display_name, display_name, SYSTEM_ID))
     conn.commit()
     cur.close()
-    log_query(query, [new_code, p_type, display_name, display_name, _sid()],
+    log_query(query, [new_code, p_type, display_name, display_name, SYSTEM_ID],
               ['INSERT OK'], (datetime.now() - start).total_seconds() * 1000, "create_party")
     return new_code, display_name
 
@@ -4056,7 +4002,7 @@ def _next_voucher_id(cur, doc_type: str) -> int:
     cur.execute(
         "SELECT IFNULL(MAX(at_id), 0) FROM acc_trans_m "
         "WHERE SUBSTRING(at_id, 5, 2) = %s AND system_id = %s",
-        (doc_type, _sid()),
+        (doc_type, SYSTEM_ID),
     )
     current = int(cur.fetchone()[0] or 0)
     at_id = max(seed, current + 1)
@@ -4064,7 +4010,7 @@ def _next_voucher_id(cur, doc_type: str) -> int:
     for _ in range(1000):
         cur.execute(
             "SELECT 1 FROM acc_trans_m WHERE at_id = %s AND system_id = %s LIMIT 1",
-            (at_id, _sid()),
+            (at_id, SYSTEM_ID),
         )
         if cur.fetchone() is None:
             return at_id
@@ -4116,7 +4062,7 @@ def insert_voucher(conn, entry_type: str, party_code, bank_res: Resolution,
             new_id, trans_date, at_desc, doc_type, PMODE[doc_type],
             bank_label, bank_acc_val, cheque_no, cheque_date,
             description, amount, party_code, description,
-            _uid(), now, _sid(), INCLUDE_IN_BILLING,
+            USER_ID, now, SYSTEM_ID, INCLUDE_IN_BILLING,
         ))
 
         detail_sql = (
@@ -4138,17 +4084,17 @@ def insert_voucher(conn, entry_type: str, party_code, bank_res: Resolution,
         for leg in legs:
             cur.execute(detail_sql, (new_id, leg['sno'], leg['code'], leg['dc'],
                                      leg['amount'], description, trans_date,
-                                     party_code, _sid()))
+                                     party_code, SYSTEM_ID))
             cur.execute(reconcile_sql, (new_id, leg['sno'], leg['code'], leg['dc'],
                                         leg['amount'], description, trans_date,
-                                        party_code, _sid()))
+                                        party_code, SYSTEM_ID))
 
         cur.execute(
             "INSERT INTO voucher_cousting "
             "(system_id,voucher_id,ref_id,voucher_type,start_date_time,end_date_time,time_spent) "
             "VALUES (%s,%s,NULL,%s,%s,%s,0) "
             "ON DUPLICATE KEY UPDATE end_date_time = VALUES(end_date_time)",
-            (_sid(), new_id, doc_type, now, now),
+            (SYSTEM_ID, new_id, doc_type, now, now),
         )
         conn.commit()
         log_query(f"INSERT {entry_type}",
@@ -4389,7 +4335,7 @@ def commit_voucher(conn, d: VoucherCommit) -> Dict[str, Any]:
             conn,
             "SELECT p_code, p_type, company_name, person_name FROM acc_party "
             "WHERE p_code = %s AND system_id = %s LIMIT 1",
-            (party_code, _sid()), "commit_voucher.party")
+            (party_code, SYSTEM_ID), "commit_voucher.party")
         if not rows:
             raise ValueError(
                 "That customer/vendor record no longer exists in LockInLedger. "
@@ -4666,7 +4612,7 @@ class AccountingBot:
         query = ("SELECT at_doc_type, COUNT(*) AS cnt, SUM(at_m_amount) AS total "
                  "FROM acc_trans_m WHERE at_doc_type IN (%s,%s) AND system_id = %s "
                  "AND at_status >= 1 GROUP BY at_doc_type")
-        rows = _fetch_all(conn, query, (DOC_TYPE_CRV, DOC_TYPE_CPV, _sid()),
+        rows = _fetch_all(conn, query, (DOC_TYPE_CRV, DOC_TYPE_CPV, SYSTEM_ID),
                           "get_financial_analysis")
         income = next((r['total'] for r in rows if r['at_doc_type'] == DOC_TYPE_CRV), 0) or 0
         expense = next((r['total'] for r in rows if r['at_doc_type'] == DOC_TYPE_CPV), 0) or 0
@@ -4683,7 +4629,7 @@ class AccountingBot:
         query = ("SELECT at_id, at_doc_type, at_desc, at_remarks, at_m_amount, at_date "
                  "FROM acc_trans_m WHERE at_doc_type IN (%s,%s) AND system_id = %s "
                  "AND at_status >= 1 ORDER BY at_id DESC LIMIT %s")
-        rows = _fetch_all(conn, query, (DOC_TYPE_CRV, DOC_TYPE_CPV, _sid(), limit),
+        rows = _fetch_all(conn, query, (DOC_TYPE_CRV, DOC_TYPE_CPV, SYSTEM_ID, limit),
                           "get_records")
         if not rows:
             text = "No transactions recorded yet."
@@ -4885,16 +4831,13 @@ Return ONLY valid JSON, no markdown, no extra text.
         # The entry type rides along: on a receipt "from" introduces the
         # payer rather than the bank, and putting the category in the wrong
         # half of the sentence would hand back a line that no longer parses.
-        # Keyed by company too: two tenants must never be able to collide
-        # on a client-generated session id and swap half-written vouchers.
-        self._pending[f'{_sid()}:{session_id}'] = {'msg': msg.strip(),
-                                                   'entry_type': entry_type}
+        self._pending[session_id] = {'msg': msg.strip(), 'entry_type': entry_type}
 
     def _take_pending(self, session_id: Optional[str]) -> Optional[Dict]:
         """Read it once. A line that has been offered back is done."""
         if not session_id:
             return None
-        return getattr(self, '_pending', {}).pop(f'{_sid()}:{session_id}', None)
+        return getattr(self, '_pending', {}).pop(session_id, None)
 
     # ---------------- chat handlers for v6 features ----------------
     @staticmethod
@@ -5573,7 +5516,7 @@ Return ONLY valid JSON, no markdown, no extra text.
                     conn,
                     "SELECT company_name, person_name FROM acc_party "
                     "WHERE p_code = %s AND system_id = %s LIMIT 1",
-                    (upd.party_code, _sid()), "edit_draft.party")
+                    (upd.party_code, SYSTEM_ID), "edit_draft.party")
                 if rows:
                     proposed['party_name'] = (rows[0].get('company_name')
                                               or rows[0].get('person_name'))
@@ -6808,7 +6751,7 @@ Return ONLY valid JSON, no markdown, no extra text.
         try:
             conn = get_connection()
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM acc_party WHERE system_id = %s", (_sid(),))
+            cur.execute("SELECT COUNT(*) FROM acc_party WHERE system_id = %s", (SYSTEM_ID,))
             party_count = cur.fetchone()[0]
             cur.close()
             chart = get_chart(conn, force=True)
@@ -6820,7 +6763,7 @@ Return ONLY valid JSON, no markdown, no extra text.
             return {
                 "bot": self.name, "status": "healthy", "database": "connected",
                 "groq": "connected" if self.groq_client else "not_configured",
-                "system_id": _sid(),
+                "system_id": SYSTEM_ID,
                 "parties": party_count,
                 "postable_accounts": len(chart),
                 "accounts_by_nature": by_nature,
@@ -6905,7 +6848,7 @@ def _main_has_transactions(conn, main_code: str) -> int:
         conn,
         "SELECT COUNT(*) AS n FROM acc_trans_d "
         "WHERE at_acc_code = %s AND at_system_id = %s",
-        (main_code, _sid()), "main_has_transactions")
+        (main_code, SYSTEM_ID), "main_has_transactions")
     return int(rows[0]['n']) if rows else 0
 
 
@@ -6946,7 +6889,7 @@ def add_chart_account(conn, level: str, name: str, parent_code: str) -> Dict[str
             if not par:
                 raise ValueError(f"Nature {nature} does not exist.")
             cur.execute("SELECT 1 FROM account_nature_user WHERE acc_nature_id = %s "
-                        "AND acc_nature_system_id = %s", (nature, _sid()))
+                        "AND acc_nature_system_id = %s", (nature, SYSTEM_ID))
             if not cur.fetchone():
                 raise ValueError(f"{par['acc_nature_desc']} is not part of this "
                                  f"company's chart.")
@@ -6967,7 +6910,7 @@ def add_chart_account(conn, level: str, name: str, parent_code: str) -> Dict[str
                 " acc_nature_id, acc_main_status, acc_main_sort, hasSubAcc, "
                 " acc_main_activity, acc_main_display_status, show_balance) "
                 "VALUES (%s,%s,%s,1,%s,NULL,%s,1,1)",
-                (_sid(), new_id, nature, 0, flags['activity'] or 0))
+                (SYSTEM_ID, new_id, nature, 0, flags['activity'] or 0))
             parent_label = par['acc_nature_desc']
 
         elif level == 'sub':
@@ -6991,7 +6934,7 @@ def add_chart_account(conn, level: str, name: str, parent_code: str) -> Dict[str
             cur.execute("SELECT * FROM account_main WHERE acc_main_id = %s", (parent_code,))
             par = cur.fetchone()
             cur.execute("SELECT * FROM account_main_user WHERE acc_main_id = %s "
-                        "AND acc_main_system_id = %s", (parent_code, _sid()))
+                        "AND acc_main_system_id = %s", (parent_code, SYSTEM_ID))
             mine = cur.fetchone()
 
             label = next((m['name'] for n in tree for m in n['mains']
@@ -7038,13 +6981,13 @@ def add_chart_account(conn, level: str, name: str, parent_code: str) -> Dict[str
                 " acc_sub_sort, acc_sub_status, hasAcc, acc_sub_activity, "
                 " show_balance, acc_sub_display_status) "
                 "VALUES (%s,%s,%s,%s,1,NULL,%s,1,1)",
-                (_sid(), new_id, parent_code, 0, flags['activity'] or 0))
+                (SYSTEM_ID, new_id, parent_code, 0, flags['activity'] or 0))
             # The main is now a heading. Without this the host UI still shows it
             # as a postable account.
             cur.execute(
                 "UPDATE account_main_user SET hasSubAcc = 1 "
                 "WHERE acc_main_id = %s AND acc_main_system_id = %s",
-                (parent_code, _sid()))
+                (parent_code, SYSTEM_ID))
             parent_label = par.get('acc_main_desc') or label or parent_code
         else:
             raise ValueError("level must be 'main' or 'sub'.")
@@ -7056,7 +6999,7 @@ def add_chart_account(conn, level: str, name: str, parent_code: str) -> Dict[str
         raise
     cur.close()
 
-    _chart_cache_bust(_sid())           # next lookup sees the new account
+    _chart_cache["at"] = 0.0            # next lookup sees the new account
     print(f"[chart] created {level} {new_id} - {name} (under {parent_label})")
     return {"created": True, "level": level, "code": str(new_id), "name": name,
             "parent_code": parent_code, "parent_name": parent_label}
@@ -7160,7 +7103,7 @@ def rename_chart_account(conn, code: str, new_name: str) -> Dict[str, Any]:
         cur.close()
         raise
     cur.close()
-    _chart_cache_bust(_sid())
+    _chart_cache["at"] = 0.0
     print(f"[chart] renamed {code}: {label!r} -> {new_name!r}")
     return {"code": code, "old_name": label, "name": new_name,
             "message": f"Renamed {code} — \"{label}\" is now \"{new_name}\"."}
@@ -7201,7 +7144,7 @@ def set_chart_account_active(conn, code: str, active: bool) -> Dict[str, Any]:
         cur.execute(
             f"UPDATE `{user_tbl}` SET `{status_col}` = %s, `{display_col}` = %s "
             f"WHERE `{id_col}` = %s AND `{sys_col}` = %s",
-            (1 if active else 0, 1 if active else 0, code, _sid()))
+            (1 if active else 0, 1 if active else 0, code, SYSTEM_ID))
         if cur.rowcount == 0:
             raise ValueError(f"\"{label}\" is not part of this company's chart.")
         conn.commit()
@@ -7210,7 +7153,7 @@ def set_chart_account_active(conn, code: str, active: bool) -> Dict[str, Any]:
         cur.close()
         raise
     cur.close()
-    _chart_cache_bust(_sid())
+    _chart_cache["at"] = 0.0
     verb = 'back in' if active else 'out of'
     print(f"[chart] {'activated' if active else 'deactivated'} {code} - {label}")
     return {"code": code, "name": label, "active": active,
@@ -7305,7 +7248,7 @@ def create_party_full(conn, data: PartyCreate) -> Dict[str, Any]:
              data.email, data.phone, data.fax,
              data.sale_tax_no, data.fedral_id_no, data.job_title,
              data.business_desc, data.other_desc,
-             p_account, int(data.status), _sid()),
+             p_account, int(data.status), SYSTEM_ID),
         )
         conn.commit()
     except Exception:
@@ -7339,7 +7282,7 @@ def fetch_party(conn, p_code: Any) -> Dict[str, Any]:
         "       Address, user_city, user_state, user_zipcode, sale_tax_no, "
         "       fedral_id_no, job_title, business_desc, other_desc, p_account, status "
         "FROM acc_party WHERE p_code = %s AND system_id = %s LIMIT 1",
-        (p_code, _sid()), "fetch_party")
+        (p_code, SYSTEM_ID), "fetch_party")
     if not rows:
         return {"found": False, "error": f"No profile {p_code} for this company."}
     r = rows[0]
@@ -7408,7 +7351,7 @@ def update_party(conn, p_code: Any, changes: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in fields.items():
         sets.append(f"`{_PARTY_COLUMN.get(k, k)}` = %s")
         params.append('' if v == '' else v)
-    params += [p_code, _sid()]
+    params += [p_code, SYSTEM_ID]
 
     cur = conn.cursor()
     try:
@@ -7438,7 +7381,7 @@ def list_parties(conn, q: Optional[str] = None, p_type: Optional[str] = None,
     sql = ("SELECT p_code, p_type, company_name, person_name, Email, Phone, "
            "       p_account, status "
            "FROM acc_party WHERE system_id = %s AND status = 1")
-    params: tuple = (_sid(),)
+    params: tuple = (SYSTEM_ID,)
     if p_type:
         sql += " AND p_type = %s"
         params += (p_type,)
@@ -7478,10 +7421,10 @@ def fetch_voucher(conn, at_id: Any) -> Dict[str, Any]:
         "       at_m_amount, at_party_code, at_bank, at_bank_acc, at_cheque_no, "
         "       at_cheque_date, at_status, at_cr_user, at_cr_date, at_up_user, at_up_date "
         "FROM acc_trans_m WHERE at_id = %s AND system_id = %s",
-        (at_id, _sid()), "fetch_voucher.master")
+        (at_id, SYSTEM_ID), "fetch_voucher.master")
     if not master_rows:
         return {"found": False,
-                "error": f"No voucher {at_id} for system_id {_sid()}."}
+                "error": f"No voucher {at_id} for system_id {SYSTEM_ID}."}
     m = master_rows[0]
 
     doc_type = m['at_doc_type']
@@ -7495,20 +7438,20 @@ def fetch_voucher(conn, at_id: Any) -> Dict[str, Any]:
         conn,
         "SELECT at_sno, at_acc_code, at_dc_type, at_amount, at_remarks, atd_date, atd_party "
         "FROM acc_trans_d WHERE at_id = %s AND at_system_id = %s ORDER BY at_sno",
-        (at_id, _sid()), "fetch_voucher.legs")
+        (at_id, SYSTEM_ID), "fetch_voucher.legs")
 
     rec = _fetch_all(
         conn,
         "SELECT COUNT(*) AS n FROM acc_trans_reconcile "
         "WHERE at_id = %s AND at_system_id = %s AND at_acc_reconcile = 1",
-        (at_id, _sid()), "fetch_voucher.reconciled")
+        (at_id, SYSTEM_ID), "fetch_voucher.reconciled")
     reconciled = int(rec[0]['n']) if rec else 0
 
     party_rows = _fetch_all(
         conn,
         "SELECT p_code, p_type, company_name, person_name FROM acc_party "
         "WHERE p_code = %s AND system_id = %s LIMIT 1",
-        (m['at_party_code'], _sid()), "fetch_voucher.party") if m['at_party_code'] else []
+        (m['at_party_code'], SYSTEM_ID), "fetch_voucher.party") if m['at_party_code'] else []
     party = party_rows[0] if party_rows else None
 
     # Identify the two legs by DEBIT/CREDIT, not by at_sno and not by nature.
@@ -7625,7 +7568,7 @@ def update_voucher(conn, at_id: Any, upd: VoucherUpdate) -> Dict[str, Any]:
     prows = _fetch_all(conn,
                        "SELECT p_code, p_type, company_name, person_name FROM acc_party "
                        "WHERE p_code = %s AND system_id = %s LIMIT 1",
-                       (party_code, _sid()), "update_voucher.party")
+                       (party_code, SYSTEM_ID), "update_voucher.party")
     if not prows:
         raise ValueError(f"Party {party_code} does not exist for this company. "
                          f"Create the profile first.")
@@ -7662,7 +7605,7 @@ def update_voucher(conn, at_id: Any, upd: VoucherUpdate) -> Dict[str, Any]:
             "SELECT at_status, (SELECT COUNT(*) FROM acc_trans_reconcile r "
             "  WHERE r.at_id = m.at_id AND r.at_system_id = %s AND r.at_acc_reconcile = 1) "
             "FROM acc_trans_m m WHERE m.at_id = %s AND m.system_id = %s FOR UPDATE",
-            (_sid(), at_id, _sid()))
+            (SYSTEM_ID, at_id, SYSTEM_ID))
         row = cur.fetchone()
         if not row:
             raise ValueError(
@@ -7684,12 +7627,12 @@ def update_voucher(conn, at_id: Any, upd: VoucherUpdate) -> Dict[str, Any]:
              (bank_row['desc'] or bank_row['code'])[:AT_BANK_LABEL_MAX_LEN],
              bank_row['code'][:AT_BANK_ACC_MAX_LEN], cheque_no, cheque_date,
              description, amount, party_code, description,
-             _uid(), now, at_id, _sid()))
+             USER_ID, now, at_id, SYSTEM_ID))
 
         cur.execute("DELETE FROM acc_trans_d WHERE at_id = %s AND at_system_id = %s",
-                    (at_id, _sid()))
+                    (at_id, SYSTEM_ID))
         cur.execute("DELETE FROM acc_trans_reconcile WHERE at_id = %s AND at_system_id = %s",
-                    (at_id, _sid()))
+                    (at_id, SYSTEM_ID))
 
         detail_sql = (
             "INSERT INTO acc_trans_d "
@@ -7704,17 +7647,17 @@ def update_voucher(conn, at_id: Any, upd: VoucherUpdate) -> Dict[str, Any]:
         for leg in legs:
             cur.execute(detail_sql, (at_id, leg['sno'], leg['code'], leg['dc'],
                                      leg['amount'], description, trans_date,
-                                     party_code, _sid()))
+                                     party_code, SYSTEM_ID))
             cur.execute(reconcile_sql, (at_id, leg['sno'], leg['code'], leg['dc'],
                                         leg['amount'], description, trans_date,
-                                        party_code, _sid()))
+                                        party_code, SYSTEM_ID))
 
         cur.execute(
             "INSERT INTO voucher_cousting "
             "(system_id,voucher_id,ref_id,voucher_type,start_date_time,end_date_time,time_spent) "
             "VALUES (%s,%s,NULL,%s,%s,%s,0) "
             "ON DUPLICATE KEY UPDATE end_date_time = VALUES(end_date_time)",
-            (_sid(), at_id, doc_type, now, now))
+            (SYSTEM_ID, at_id, doc_type, now, now))
 
         conn.commit()
     except Exception:
@@ -7768,7 +7711,7 @@ def void_voucher(conn, at_id: Any) -> Dict[str, Any]:
             "UPDATE acc_trans_m SET at_status = 0, void_date = %s, "
             "  at_up_user = %s, at_up_date = %s "
             "WHERE at_id = %s AND system_id = %s",
-            (datetime.now(), _uid(), datetime.now(), at_id, _sid()))
+            (datetime.now(), USER_ID, datetime.now(), at_id, SYSTEM_ID))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -7794,10 +7737,10 @@ def list_vouchers(conn, limit: int = 50, q: Optional[str] = None,
            "FROM acc_trans_m m "
            "LEFT JOIN acc_party p ON p.p_code = m.at_party_code AND p.system_id = m.system_id "
            "WHERE m.system_id = %s AND m.at_doc_type IN (%s, %s)")
-    params: tuple = (_sid(), DOC_TYPE_CRV, DOC_TYPE_CPV)
+    params: tuple = (SYSTEM_ID, DOC_TYPE_CRV, DOC_TYPE_CPV)
     if entry_type in ('CRV', 'CPV'):
         sql = sql.replace("m.at_doc_type IN (%s, %s)", "m.at_doc_type = %s")
-        params = (_sid(), DOC_TYPE_CRV if entry_type == 'CRV' else DOC_TYPE_CPV)
+        params = (SYSTEM_ID, DOC_TYPE_CRV if entry_type == 'CRV' else DOC_TYPE_CPV)
     if on_date:
         sql += " AND DATE(m.at_date) = %s"
         params += (on_date,)
@@ -7870,65 +7813,9 @@ bot = AccountingBot()
 
 
 # --------------------------------------------------------------------------
-# WHO IS ASKING
-#
-# ai/authorize.php checks the operator's LockInLedger session and signs a
-# short-lived token carrying their system_id. This turns that token into the
-# company for the request - and it is the ONLY way a company is ever chosen.
-# Nothing here reads system_id from the body, the query string or the prompt,
-# which is the host application's own rule.
-#
-# Attached to endpoints as `dependencies=[Depends(get_ledger_context)]` rather
-# than as a parameter, so no handler signature changes: the handlers keep
-# calling _sid(), which now answers per request.
-# --------------------------------------------------------------------------
-try:
-    from auth import (verify_token, verify_handoff, mint_session_token,
-                      TokenError, SESSION_TTL)
-except ImportError:                      # auth.py not deployed yet
-    verify_token = None
-    verify_handoff = None
-    mint_session_token = None
-    SESSION_TTL = 8 * 60 * 60
-
-    class TokenError(Exception):
-        pass
-
-
-async def get_ledger_context(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
-    """Pin this request to one company. 401 when a token is required and bad."""
-    token = None
-    if authorization and authorization.lower().startswith('bearer '):
-        token = authorization.split(None, 1)[1].strip()
-
-    if token and verify_token is not None:
-        try:
-            claims = verify_token(token)
-        except TokenError as e:
-            raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-        _CURRENT_SYSTEM_ID.set(claims['system_id'])
-        _CURRENT_USER_ID.set(claims['user_id'])
-        return {'system_id': int(claims['system_id']), 'user_id': claims['user_id'],
-                'name': claims.get('name') or '', 'authenticated': True}
-
-    if REQUIRE_LEDGER_AUTH:
-        raise HTTPException(
-            status_code=401,
-            detail="Sign in to LockInLedger to use the assistant.")
-
-    # Fallback: the single tenant from the environment, i.e. exactly how this
-    # service behaved before auth existed. Set explicitly rather than left
-    # alone, so no value can ever survive from an earlier request.
-    _CURRENT_SYSTEM_ID.set(None)
-    _CURRENT_USER_ID.set(None)
-    return {'system_id': SYSTEM_ID, 'user_id': USER_ID,
-            'name': '', 'authenticated': False}
-
-
-# --------------------------------------------------------------------------
 # API
 # --------------------------------------------------------------------------
-@app.post("/api/chat", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/chat")
 async def chat(request: ChatRequest):
     try:
         return await bot.process_message(request.message, request.session_id,
@@ -7941,7 +7828,7 @@ async def chat(request: ChatRequest):
         return {"status": "error", "message": t, "analysis": t, "confidence": "low"}
 
 
-@app.post("/api/commit", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/commit")
 async def api_commit_voucher(payload: VoucherCommit):
     """
     Post a draft the operator reviewed (the second half of preview=true).
@@ -8039,7 +7926,7 @@ def statement_text_from_upload(filename: str, data: bytes) -> Tuple[str, str]:
                      "That file is neither.")
 
 
-@app.post("/api/statement/preview", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/statement/preview")
 async def api_statement_preview(file: UploadFile = File(...),
                                 session_id: Optional[str] = Form(None),
                                 bank_account: Optional[str] = Form(None)):
@@ -8088,7 +7975,7 @@ async def api_statement_preview(file: UploadFile = File(...),
             conn.close()
 
 
-@app.post("/api/edit/batch", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/edit/batch")
 async def api_edit_batch(payload: EditBatchRequest):
     """
     Build an edit draft for each voucher, with an optional instruction already
@@ -8149,7 +8036,7 @@ async def api_edit_batch(payload: EditBatchRequest):
             conn.close()
 
 
-@app.post("/api/commit/edit", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/commit/edit")
 async def api_commit_edit(payload: EditCommit):
     """Apply an edit the operator reviewed."""
     own = payload.session_id is None
@@ -8180,7 +8067,7 @@ async def api_commit_edit(payload: EditCommit):
             conn.close()
 
 
-@app.post("/api/commit/account", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/commit/account")
 async def api_commit_account(payload: AccountCommit):
     """Create a chart account the operator reviewed. Parent arrives as a code."""
     own = payload.session_id is None
@@ -8234,7 +8121,7 @@ async def api_commit_account(payload: AccountCommit):
             conn.close()
 
 
-@app.post("/api/commit/party", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/commit/party")
 async def api_commit_party(payload: PartyCommit):
     """Create - or, with a p_code, update - a profile the operator reviewed."""
     own = payload.session_id is None
@@ -8273,7 +8160,7 @@ async def api_commit_party(payload: PartyCommit):
             conn.close()
 
 
-@app.delete("/api/session/{session_id}", dependencies=[Depends(get_ledger_context)])
+@app.delete("/api/session/{session_id}")
 async def delete_session(session_id: str):
     conn = bot._sessions.pop(session_id, None)
     if conn:
@@ -8284,7 +8171,7 @@ async def delete_session(session_id: str):
     return {"status": "ok"}
 
 
-@app.get("/api/dropdowns/{session_id}", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/dropdowns/{session_id}")
 async def get_dropdowns(session_id: str):
     conn = bot.get_session_db(session_id)
     chart = get_chart(conn)
@@ -8311,119 +8198,7 @@ async def health_check():
     return await bot.health_check()
 
 
-@app.post("/api/auth/exchange")
-async def auth_exchange(authorization: Optional[str] = Header(None)):
-    """
-    Trade the 15-minute handoff token for an 8-hour session token.
-
-    The handoff token arrives in a URL fragment, so it is the one that can
-    leak - into a screenshot, a pasted link, a browser history. It is spent
-    once, here, the moment the app loads. Everything afterwards uses the
-    session token, which never touches a URL.
-
-    Send:   Authorization: Bearer <handoff token>
-    Get:    {"token": "<session token>", "expires_at": ..., "system_id": ...}
-
-    A session token cannot be exchanged again - that would make an 8-hour
-    token renewable forever, which is just a permanent one with extra steps.
-    After 8 hours the app goes back through ai/authorize.php, and the PHP
-    session decides all over again whether this person still has access.
-    """
-    if verify_handoff is None or mint_session_token is None:
-        raise HTTPException(
-            status_code=503,
-            detail="auth.py is not deployed, so tokens cannot be exchanged.")
-
-    if not authorization or not authorization.lower().startswith('bearer '):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-
-    try:
-        claims = verify_handoff(authorization.split(None, 1)[1].strip())
-    except TokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-
-    token, exp = mint_session_token(claims['system_id'], claims['user_id'],
-                                    claims['name'])
-    print(f"AUTH: exchanged handoff -> session for system_id "
-          f"{claims['system_id']}, user {claims['user_id']}, "
-          f"valid {SESSION_TTL // 3600}h")
-    return {
-        "token": token,
-        "token_type": "bearer",
-        "expires_at": exp,                      # unix seconds
-        "expires_in": exp - int(time.time()),   # seconds from now
-        "system_id": int(claims['system_id']),
-        "user_id": claims['user_id'],
-        "name": claims['name'],
-    }
-
-
-@app.get("/api/whoami")
-async def whoami(authorization: Optional[str] = Header(None)):
-    """
-    The single place to ask what a token actually bought you.
-
-    Deliberately NOT guarded the way the data endpoints are: it answers even
-    with no token, even with a bad one, and even when REQUIRE_LEDGER_AUTH=1.
-    That is the whole point - when everything else is returning 401 this is
-    the endpoint that tells you WHY, instead of returning 401 as well.
-
-    It reads nothing from the database and never returns the secret, only
-    whether one is configured.
-    """
-    token = None
-    if authorization and authorization.lower().startswith('bearer '):
-        token = authorization.split(None, 1)[1].strip()
-
-    out: Dict[str, Any] = {
-        "token_present": bool(token),
-        "require_ledger_auth": REQUIRE_LEDGER_AUTH,
-        "auth_module_loaded": verify_token is not None,
-        "jwt_secret_configured": bool(os.getenv("LEDGERASSIST_JWT_SECRET")),
-        "session_ttl_hours": round(SESSION_TTL / 3600, 2),
-        "env_system_id": SYSTEM_ID,          # what the fallback would use
-    }
-
-    if token and verify_token is not None:
-        try:
-            claims = verify_token(token)
-        except TokenError as e:
-            out.update(authenticated=False, token_error=str(e),
-                       system_id=None, user_id=None,
-                       resolved_by="nothing - this token would be rejected",
-                       would_be_allowed=False)
-            return out
-        kind = claims.get('kind', 'handoff')
-        left = int(claims.get('exp', 0)) - int(time.time())
-        out.update(authenticated=True,
-                   system_id=int(claims['system_id']),   # the company it posts into
-                   user_id=claims['user_id'],            # stamped on at_cr_user
-                   name=claims.get('name') or '',
-                   token_kind=kind,                      # handoff | session
-                   expires_in=left,
-                   resolved_by="token",
-                   should_exchange=(kind == 'handoff'),
-                   would_be_allowed=True)
-        return out
-
-    if token and verify_token is None:
-        out.update(authenticated=False, system_id=None, user_id=None,
-                   token_error="auth.py is not importable, so no token can be "
-                               "checked - put it next to main2.py",
-                   resolved_by="nothing", would_be_allowed=False)
-        return out
-
-    out.update(authenticated=False,
-               system_id=None if REQUIRE_LEDGER_AUTH else SYSTEM_ID,
-               user_id=None if REQUIRE_LEDGER_AUTH else USER_ID,
-               name='',
-               resolved_by=("nothing - REQUIRE_LEDGER_AUTH=1 and no token was sent"
-                            if REQUIRE_LEDGER_AUTH else "environment fallback"),
-               would_be_allowed=not REQUIRE_LEDGER_AUTH)
-    return out
-
-
-@app.get("/api/debug/chart", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/debug/chart")
 async def debug_chart(nature: Optional[str] = None, q: Optional[str] = None):
     """Exactly what v_trans_accounts_m2 returns for this tenant."""
     conn = get_connection()
@@ -8436,7 +8211,7 @@ async def debug_chart(nature: Optional[str] = None, q: Optional[str] = None):
             rows = [r for r in rows
                     if nq in normalize_name(r['qualified']) or nq in normalize_name(r['desc'])]
         return {
-            "system_id": _sid(),
+            "system_id": SYSTEM_ID,
             "count": len(rows),
             "accounts": [
                 {"code": r['code'], "level": r['level'],
@@ -8449,7 +8224,7 @@ async def debug_chart(nature: Optional[str] = None, q: Optional[str] = None):
         conn.close()
 
 
-@app.get("/api/debug/account/{code}", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/debug/account/{code}")
 async def debug_account(code: str):
     """
     Where one account code actually lives.
@@ -8479,14 +8254,14 @@ async def debug_account(code: str):
             'account_main_user': one(
                 "SELECT acc_main_id, acc_nature_id, acc_main_status, hasSubAcc, "
                 "acc_main_display_status FROM account_main_user "
-                "WHERE acc_main_id = %s AND acc_main_system_id = %s", (code, _sid())),
+                "WHERE acc_main_id = %s AND acc_main_system_id = %s", (code, SYSTEM_ID)),
             'account_sub': one(
                 "SELECT acc_sub_id, acc_sub_desc, acc_main_id, acc_sub_status "
                 "FROM account_sub WHERE acc_sub_id = %s", (code,)),
             'account_sub_user': one(
                 "SELECT acc_sub_id, acc_main_id, acc_sub_status, hasAcc, "
                 "acc_sub_display_status FROM account_sub_user "
-                "WHERE acc_sub_id = %s AND acc_sub_system_id = %s", (code, _sid())),
+                "WHERE acc_sub_id = %s AND acc_sub_system_id = %s", (code, SYSTEM_ID)),
         }
         row = find_account(conn, code)
         tree = build_chart_tree(conn)
@@ -8506,7 +8281,7 @@ async def debug_account(code: str):
             verdict = "In " + " and ".join(present) + "."
 
         return {
-            "system_id": _sid(),
+            "system_id": SYSTEM_ID,
             "code": code,
             "level": account_level(code),
             "tables": where,
@@ -8524,14 +8299,14 @@ async def debug_account(code: str):
         conn.close()
 
 
-@app.get("/api/chart", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/chart")
 async def api_chart(nature: Optional[str] = None):
     """The nature -> main -> sub tree, as the host UI's Chart of Accounts page
     shows it - the read side of the "show chart" chat command."""
     conn = get_connection()
     try:
         tree = build_chart_tree(conn)
-        return {"system_id": _sid(),
+        return {"system_id": SYSTEM_ID,
                 "natures": [n for n in tree if not nature or n['nature'] == str(nature)]}
     finally:
         conn.close()
@@ -8561,7 +8336,7 @@ async def debug_extract(text: str):
     return out
 
 
-@app.get("/api/debug/resolve-account", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/debug/resolve-account")
 async def debug_resolve_account(text: str, side: str = "bank"):
     """side = bank | income | expense"""
     conn = get_connection()
@@ -8586,7 +8361,7 @@ async def debug_resolve_account(text: str, side: str = "bank"):
 # ==========================================================================
 # v6 API - accounts, profiles, voucher update
 # ==========================================================================
-@app.get("/api/accounts", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/accounts")
 async def api_accounts():
     """Everything the Update / Profile forms need to populate their pickers."""
     conn = get_connection()
@@ -8599,7 +8374,7 @@ async def api_accounts():
                      "nature": NATURE_LABEL.get(r['nature'], r['nature'])} for r in rows]
 
         return {
-            "system_id": _sid(),
+            "system_id": SYSTEM_ID,
             # The bank/contra leg may be ANY postable account - the host app's
             # own picker (cashBankAccounts) works the same way.
             "bank": shape(chart),
@@ -8611,7 +8386,7 @@ async def api_accounts():
         conn.close()
 
 
-@app.get("/api/parties", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/parties")
 async def api_list_parties(q: Optional[str] = None, p_type: Optional[str] = None,
                            limit: int = 500):
     conn = get_connection()
@@ -8622,7 +8397,7 @@ async def api_list_parties(q: Optional[str] = None, p_type: Optional[str] = None
         conn.close()
 
 
-@app.post("/api/parties", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/parties")
 async def api_create_party(payload: PartyCreate):
     conn = get_connection()
     try:
@@ -8636,7 +8411,7 @@ async def api_create_party(payload: PartyCreate):
         conn.close()
 
 
-@app.get("/api/vouchers", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/vouchers")
 async def api_list_vouchers(limit: int = 50, q: Optional[str] = None,
                             entry_type: Optional[str] = None):
     conn = get_connection()
@@ -8646,7 +8421,7 @@ async def api_list_vouchers(limit: int = 50, q: Optional[str] = None,
         conn.close()
 
 
-@app.get("/api/voucher/{at_id}", dependencies=[Depends(get_ledger_context)])
+@app.get("/api/voucher/{at_id}")
 async def api_get_voucher(at_id: str):
     conn = get_connection()
     try:
@@ -8656,7 +8431,7 @@ async def api_get_voucher(at_id: str):
         conn.close()
 
 
-@app.put("/api/voucher/{at_id}", dependencies=[Depends(get_ledger_context)])
+@app.put("/api/voucher/{at_id}")
 async def api_update_voucher(at_id: str, payload: VoucherUpdate):
     conn = get_connection()
     try:
@@ -8669,7 +8444,7 @@ async def api_update_voucher(at_id: str, payload: VoucherUpdate):
         conn.close()
 
 
-@app.post("/api/voucher/{at_id}/void", dependencies=[Depends(get_ledger_context)])
+@app.post("/api/voucher/{at_id}/void")
 async def api_void_voucher(at_id: str):
     conn = get_connection()
     try:
@@ -8692,7 +8467,7 @@ audit_log.register(app, bot)
 if __name__ == "__main__":
     import uvicorn
     print(f"\n{'='*62}\n{bot.name} - AI Accounting Bot (v6)\n{'='*62}")
-    print(f"System ID: {_sid()}  |  Cr User: {_uid()}")
+    print(f"System ID: {SYSTEM_ID}  |  Cr User: {USER_ID}")
     print("Accounts resolved from v_trans_accounts_m2 (postable leaves, tenant-scoped).")
     print("Nature taken from the first digit of the account code.")
     print("at_id = max(YYMM||doctype||000001, MAX(at_id)+1) per doc_type + system_id.")

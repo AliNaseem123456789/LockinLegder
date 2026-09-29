@@ -51,6 +51,10 @@ import AttachFileIcon from '@mui/icons-material/AttachFile';
 import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
 import UploadFileIcon from '@mui/icons-material/UploadFile';
 import axios from 'axios';
+// The LockInLedger handshake. See auth.js - it is the only file that knows
+// about tokens, and it is what makes this app multi-company.
+import { bootstrapAuth, attachAuth, reauthenticate, isEnabled as authEnabled }
+  from './auth';
 
 // -----------------------------------------------------------------------------
 // Config
@@ -59,8 +63,8 @@ import axios from 'axios';
 // referencing it throws at module load, which blanks the whole app. Set the URL
 // from index.html when it differs from the default:
 //     <script>window.__API_BASE_URL__ = "https://ledger.internal:8000";</script>
-// const API_BASE_URL =(typeof window !== 'undefined' && window.__API_BASE_URL__) || 'http://localhost:8000';
-const API_BASE_URL ="https://lockinledgerwebsite.duckdns.org"
+const API_BASE_URL =
+  (typeof window !== 'undefined' && window.__API_BASE_URL__) || 'http://localhost:8000';
 
 // -----------------------------------------------------------------------------
 // Design tokens — a neutral enterprise palette, one accent, no gradients.
@@ -2345,7 +2349,7 @@ const INTRO = {
     examples: [
       ['Edit voucher 261203000165',
        'Open one voucher for review and correction'],
-      ['Edit voucher 261203000165 and change category to Healthcare Services',
+      ['Edit voucher 261203000165 and change the amount to $500',
        'Modify voucher fields (e.g., amount, date, bank, or category).'],
       ['Edit vouchers dated 7-june-2026',
        'Display all entries for a specific day to select records for modification.'],
@@ -3025,6 +3029,11 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [activity, setActivity] = useState([]);
   const [snack, setSnack] = useState(null);
+  // Who the ledger says this is. Until this resolves the app shows nothing,
+  // because every request it could make needs a company on it.
+  //   state: 'checking' | 'ready' | 'failed'
+  const [auth, setAuth] = useState({ state: 'checking', name: '',
+                                     systemId: null, error: '' });
   // The confirmation step. `draft` is the editable, still-unwritten voucher;
   // it exists only between pressing Enter and pressing Post.
   const [draft, setDraft] = useState(null);
@@ -3049,8 +3058,11 @@ export default function App() {
 
   // One axios instance for the app's lifetime — rebuilding it each render
   // re-registers interceptors and leaks them.
+  // No default Content-Type: axios sets application/json for a plain object
+  // and the correct multipart boundary for a FormData, which a hardcoded
+  // header would break for statement uploads.
   const api = useMemo(
-    () => axios.create({ baseURL: API_BASE_URL, timeout: 60000, headers: { 'Content-Type': 'application/json' } }),
+    () => attachAuth(axios.create({ baseURL: API_BASE_URL, timeout: 60000 })),
     []
   );
 
@@ -3084,10 +3096,32 @@ export default function App() {
     }
   }, [api]);
 
+  // Sign in FIRST, then start the app.
+  //
+  // Deliberately sequential. checkConnection() fetches the chart of accounts,
+  // and which chart that is depends entirely on the token - firing them
+  // together would race, and on a slow link would load one company's accounts
+  // into another company's session.
   useEffect(() => {
-    setSessionId('session_' + Date.now() + '_' + Math.random().toString(36).slice(2, 11));
-    setMessages([{ ...GREETING, timestamp: new Date() }]);
-    checkConnection();
+    let cancelled = false;
+    (async () => {
+      try {
+        const who = await bootstrapAuth(API_BASE_URL);
+        if (cancelled) return;
+        setAuth({ state: 'ready', name: who.name || '',
+                  systemId: who.systemId, error: '' });
+      } catch (e) {
+        if (cancelled) return;
+        setAuth({ state: 'failed', name: '', systemId: null,
+                  error: e?.message || String(e) });
+        return;
+      }
+      if (cancelled) return;
+      setSessionId('session_' + Date.now() + '_' + Math.random().toString(36).slice(2, 11));
+      setMessages([{ ...GREETING, timestamp: new Date() }]);
+      checkConnection();
+    })();
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -3211,8 +3245,11 @@ export default function App() {
 
       // Reading sixty rows against the chart takes longer than a sentence
       // does, and the default timeout would cut it off mid-file.
-      const { data } = await axios.post(`${API_BASE_URL}/api/statement/preview`,
-                                        form, { timeout: 180000 });
+      // `api`, not a bare axios call - a bare one carries no token, so on a
+      // multi-company deployment the statement would be read against whatever
+      // the server falls back to rather than against this operator's chart.
+      const { data } = await api.post('/api/statement/preview', form,
+                                      { timeout: 180000 });
 
       if (data.status === 'draft' && data.drafts?.length) {
         setMessages((prev) => [...prev, {
@@ -3639,6 +3676,58 @@ export default function App() {
   ) : null;
 
 
+  // Nothing renders until the ledger has said who this is. Not a nicety: the
+  // chart, the party list and every draft belong to one company, and showing
+  // the app before that is settled means showing an empty or - far worse - a
+  // stale one.
+  if (auth.state !== 'ready') {
+    return (
+      <ThemeProvider theme={theme}>
+        <CssBaseline />
+        <Box sx={{ height: '100vh', display: 'grid', placeItems: 'center',
+                   background: C.bg, px: 3 }}>
+          <Box sx={{ maxWidth: 460, textAlign: 'center' }}>
+            <Box sx={{ display: 'flex', justifyContent: 'center', mb: 1.75 }}>
+              <BotAvatar size={40} />
+            </Box>
+            {auth.state === 'checking' ? (
+              <>
+                <Typography sx={{ fontSize: 14, fontWeight: 600, color: C.ink }}>
+                  Signing you in through LockInLedger…
+                </Typography>
+                <Typography sx={{ fontSize: 12.5, color: C.inkMute, mt: 0.5 }}>
+                  One moment — this uses the session you already have.
+                </Typography>
+                <CircularProgress size={16} thickness={5}
+                                  sx={{ mt: 2, color: C.inkMute }} />
+              </>
+            ) : (
+              <>
+                <Typography sx={{ fontSize: 14, fontWeight: 600, color: C.err }}>
+                  Couldn’t sign in
+                </Typography>
+                <Typography sx={{ fontSize: 12.5, color: C.inkMid, mt: 0.75,
+                                  whiteSpace: 'pre-wrap', textAlign: 'left',
+                                  lineHeight: 1.6 }}>
+                  {auth.error}
+                </Typography>
+                <Button
+                  size="small"
+                  onClick={() => { try { sessionStorage.clear(); } catch { /* ignore */ }
+                                   window.location.reload(); }}
+                  sx={{ mt: 2, px: 1.5, fontSize: 12.5, color: C.accent,
+                        border: `1px solid ${C.line}`, borderRadius: '7px' }}
+                >
+                  Try again
+                </Button>
+              </>
+            )}
+          </Box>
+        </Box>
+      </ThemeProvider>
+    );
+  }
+
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
@@ -3661,11 +3750,17 @@ export default function App() {
                               lineHeight: 1.25 }}>
               LedgerAssist
             </Typography>
+            {/* Which company this session posts into. On a one-company
+                install it is reassurance; on a multi-company one it is the
+                single most important thing on the screen, because every
+                voucher typed below lands in whatever this says. */}
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.6 }}>
               <Box sx={{ width: 6, height: 6, borderRadius: '50%',
                          background: connection.state === 'offline' ? C.err : C.ok }} />
-              <Typography sx={{ fontSize: 11.5, color: C.inkMute }}>
+              <Typography sx={{ fontSize: 11.5, color: C.inkMute }} noWrap>
                 {connection.state === 'offline' ? 'Offline' : 'Online'}
+                {auth.systemId ? ` · Company ${auth.systemId}` : ''}
+                {auth.name ? ` · ${auth.name}` : ''}
               </Typography>
             </Box>
           </Box>
@@ -3713,7 +3808,15 @@ export default function App() {
             </IconButton>
           </Tooltip>
 
-          <UserAvatar size={32} />
+          {authEnabled() ? (
+            <Tooltip title={`Signed in from LockInLedger${auth.name ? ` as ${auth.name}` : ''} — click to sign in again`}>
+              <Box onClick={reauthenticate} sx={{ cursor: 'pointer' }}>
+                <UserAvatar size={32} initial={auth.name || 'You'} />
+              </Box>
+            </Tooltip>
+          ) : (
+            <UserAvatar size={32} />
+          )}
         </Box>
 
         {/* Body --------------------------------------------------------- */}
