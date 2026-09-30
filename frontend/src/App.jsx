@@ -53,8 +53,7 @@ import UploadFileIcon from '@mui/icons-material/UploadFile';
 import axios from 'axios';
 // The LockInLedger handshake. See auth.js - it is the only file that knows
 // about tokens, and it is what makes this app multi-company.
-import { bootstrapAuth, attachAuth, reauthenticate, isEnabled as authEnabled }
-  from './auth';
+import { bootstrapAuth, attachAuth, reauthenticate, isEnabled as authEnabled }from './Auth';
 
 // -----------------------------------------------------------------------------
 // Config
