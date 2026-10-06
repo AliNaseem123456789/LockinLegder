@@ -62,9 +62,9 @@ import { bootstrapAuth, attachAuth, reauthenticate, isEnabled as authEnabled }fr
 // referencing it throws at module load, which blanks the whole app. Set the URL
 // from index.html when it differs from the default:
 //     <script>window.__API_BASE_URL__ = "https://ledger.internal:8000";</script>
-const API_BASE_URL ='https://lockingledger.duckdns.org'
-// const API_BASE_URL =
-//   (typeof window !== 'undefined' && window.__API_BASE_URL__) || 'http://localhost:8000';
+// const API_BASE_URL ='https://lockingledger.duckdns.org'
+const API_BASE_URL =
+  (typeof window !== 'undefined' && window.__API_BASE_URL__) || 'http://localhost:8000';
 
 // -----------------------------------------------------------------------------
 // Design tokens — a neutral enterprise palette, one accent, no gradients.
@@ -143,7 +143,8 @@ const draftKey = (d) => String(d?.at_id || d?.draft_id || '');
 // A statement arrives as a file, not a sentence — these are the ones worth
 // trying. Anything else is refused in the browser rather than uploaded and
 // rejected.
-const STATEMENT_TYPES = '.pdf,.txt,.csv,.tsv';
+// Photos and scans are read with OCR on the server.
+const STATEMENT_TYPES = '.pdf,.txt,.csv,.tsv,.png,.jpg,.jpeg,.tif,.tiff';
 const STATEMENT_MAX_MB = 15;
 
 const formatDateForDisplay = (iso) => {
@@ -778,8 +779,14 @@ const AccountCard = ({ card, onCommand, flush }) => (
 // READ, and nothing was written. So it is a manifest — counts, totals, and
 // what still needs a hand — rather than a receipt. The vouchers themselves
 // arrive one at a time in the review panel.
-const StatementCard = ({ card, flush }) => {
+const StatementCard = ({ card, flush, onBulkMisc, active }) => {
   const [showSkipped, setShowSkipped] = useState(false);
+  // How each row's account was settled, counted by the server, and the
+  // Miscellaneous account for each side - so a whole file's guesses can be
+  // moved in one press instead of sixty trips to the account picker.
+  const counts = card.category_counts || null;
+  const misc = card.misc_accounts || {};
+  const hasMisc = Object.keys(misc).length > 0;
   const skipped = card.skipped || [];
   const newParties = card.new_parties || [];
 
@@ -874,6 +881,52 @@ const StatementCard = ({ card, flush }) => {
               ))}
             </Box>
           </Collapse>
+        </Box>
+      ) : null}
+
+      {counts && hasMisc ? (
+        <Box sx={{ mt: 1.25, pt: 1, borderTop: `1px solid ${C.line}` }}>
+          <Typography sx={{ fontSize: 10.5, color: C.inkMute, textTransform: 'uppercase',
+                            letterSpacing: '0.06em', mb: 0.3 }}>
+            Accounts
+          </Typography>
+          <Typography sx={{ fontSize: 11.5, color: C.inkMid }}>
+            <b>{counts.matched}</b> matched
+            {' · '}<b style={{ color: counts.guessed ? C.warn : undefined }}>
+              {counts.guessed}</b> guessed
+            {' · '}<b>{counts.misc}</b> under Miscellaneous
+            {counts.missing ? <>{' · '}<b style={{ color: C.err }}>{counts.missing}</b> missing</> : null}
+          </Typography>
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 0.9 }}>
+            {counts.guessed + counts.missing > 0 ? (
+              <Button
+                size="small"
+                disabled={!active}
+                onClick={() => onBulkMisc?.('guessed', misc)}
+                sx={{ minHeight: 26, px: 1, fontSize: 12, borderRadius: '5px',
+                      color: C.warn, border: `1px solid #FEDF89`,
+                      '&:hover': { background: C.warnSoft, borderColor: C.warn } }}
+              >
+                Move the {counts.guessed + counts.missing} guessed to Miscellaneous
+              </Button>
+            ) : null}
+            <Button
+              size="small"
+              disabled={!active}
+              onClick={() => onBulkMisc?.('all', misc)}
+              sx={{ minHeight: 26, px: 1, fontSize: 12, borderRadius: '5px',
+                    color: C.inkMid, border: `1px solid ${C.line}`,
+                    '&:hover': { background: C.raised, borderColor: C.lineStrong } }}
+            >
+              Put every row under Miscellaneous
+            </Button>
+          </Box>
+          <Typography sx={{ mt: 0.6, fontSize: 11, color: C.inkMute }}>
+            {active
+              ? `Changes only the rows not saved yet — ${Object.entries(misc)
+                  .map(([t, a]) => `${t} → ${a.qualified}`).join(', ')}.`
+              : 'This statement’s review is closed.'}
+          </Typography>
         </Box>
       ) : null}
 
@@ -2121,7 +2174,7 @@ const friendlyNetworkError = (error) => {
 
 
 const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
-                   onStatementAccount, busy }) => {
+                   onStatementAccount, onStatementBulk, activeQueueSource, busy }) => {
   if (msg.type === 'user') {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'flex-start',
@@ -2251,7 +2304,8 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
         {msg.card?.kind === 'voucher_list'
           ? <VoucherListCard card={msg.card} onBulkEdit={onBulkEdit} busy={busy} /> : null}
         {msg.card?.kind === 'statement_summary'
-          ? <StatementCard card={msg.card} flush={bare} /> : null}
+          ? <StatementCard card={msg.card} flush={bare} onBulkMisc={onStatementBulk}
+                           active={activeQueueSource === msg.id} /> : null}
         {msg.card?.kind === 'statement_bank_pick'
           ? <StatementBankPickCard card={msg.card} onRetry={onStatementAccount}
                                    busy={busy} flush={bare} /> : null}
@@ -2330,8 +2384,8 @@ const INTRO = {
     blurb: 'Attach a bank or credit-card statement. Every line comes back as a '
       + 'draft voucher for you to check — deposits as CRVs, withdrawals as CPVs.',
     examples: [
-      ['Choose a PDF or CSV your bank gave you',
-       'A downloaded statement, not a scan or a photo — a scan has no text to read.'],
+      ['Choose a PDF, CSV or a photo of the statement',
+       'Downloaded PDFs read best. Scans and photos are read with OCR — check the amounts.'],
       ['One account per file',
        'It reads the account number off the page; if that matches nothing, it asks '
        + 'once rather than leaving every row blank.'],
@@ -3214,6 +3268,15 @@ export default function App() {
     inputRef.current?.focus();
   }, []);
 
+  // The server can add an account while building a draft - Miscellaneous
+  // Income, the first time a company needs one. The pickers were loaded at
+  // start-up and don't have it, so the panel's dropdown would show the field
+  // empty although the draft is filled. Reload them when that happens.
+  const refreshPickersIfUnknown = useCallback((codes) => {
+    const known = new Set((pickers.all || []).map((a) => String(a.code)));
+    if ((codes || []).some((c) => c && !known.has(String(c)))) checkConnection();
+  }, [pickers, checkConnection]);
+
   // ---- A statement, read in --------------------------------------------
   //
   // Deliberately the same shape as sending a sentence: it posts, it gets a
@@ -3252,12 +3315,19 @@ export default function App() {
                                       { timeout: 180000 });
 
       if (data.status === 'draft' && data.drafts?.length) {
+        const msgId = Date.now() + 1;
         setMessages((prev) => [...prev, {
-          id: Date.now() + 1, type: 'bot', timestamp: new Date(),
+          id: msgId, type: 'bot', timestamp: new Date(),
           content: data.message || data.analysis || '',
           card: data.card || null,
         }]);
-        setQueue({ drafts: data.drafts, index: 0, saved: new Set() });
+        // `source` ties the queue to its summary card, so the card's bulk
+        // buttons only work while THIS statement is the one being reviewed.
+        setQueue({ drafts: data.drafts, index: 0, saved: new Set(), source: msgId });
+        refreshPickersIfUnknown([
+          ...data.drafts.map((d) => d.category_acc_code),
+          ...Object.values(data.card?.misc_accounts || {}).map((a) => a.code),
+        ]);
         setDraft(data.drafts[0]);
         setDraftMsgId(null);
         setPostError(null);
@@ -3285,7 +3355,7 @@ export default function App() {
     } finally {
       setIsLoading(false);
     }
-  }, [api, sessionId, isLoading, showSnack]);
+  }, [api, sessionId, isLoading, showSnack, refreshPickersIfUnknown]);
 
   const retryStatementWithAccount = useCallback((code) => {
     const acc = (pickers.all || []).find((a) => String(a.code) === String(code));
@@ -3367,6 +3437,7 @@ export default function App() {
         setDraft(d);
         setDraftMsgId(id);
         setPostError(null);
+        refreshPickersIfUnknown([d.category_acc_code]);
         return;
       }
 
@@ -3595,6 +3666,49 @@ export default function App() {
       setPosting(false);
     }
   };
+
+  // "Move the guesses / every row to Miscellaneous" from a statement card.
+  // Only rows not yet saved change, and only in the browser: nothing is
+  // written until each row is saved, exactly as before.
+  const applyMiscToQueue = useCallback((scope, miscAccounts) => {
+    if (!queue) {
+      showSnack('That statement’s review is closed', 'info');
+      return;
+    }
+    let moved = 0;
+    const drafts = queue.drafts.map((d, i) => {
+      // The row on screen may have edits that aren't in the queue yet.
+      const cur = i === queue.index && draft ? draft : d;
+      if (queue.saved.has(draftKey(cur))) return cur;
+      const m = (miscAccounts || {})[cur.entry_type];
+      if (!m) return cur;
+      const wanted = scope === 'all'
+        || ['guessed', 'missing'].includes(cur.category_status);
+      if (!wanted || String(cur.category_acc_code) === String(m.code)) return cur;
+      moved += 1;
+      return {
+        ...cur,
+        category_acc_code: m.code,
+        category_account: m.qualified,
+        category_status: 'misc',
+        // The operator chose this, so it is no longer the assistant's guess.
+        category_matched: true,
+        category_guessed: false,
+        category_note: null,
+        category_note_short: null,
+        review_items: (cur.review_items || []).filter(
+          (r) => !/^category/i.test(r)),
+      };
+    });
+    setQueue({ ...queue, drafts });
+    if (draft && queue.drafts[queue.index]
+        && draftKey(draft) === draftKey(queue.drafts[queue.index])) {
+      setDraft(drafts[queue.index]);
+    }
+    showSnack(moved
+      ? `${moved} row${moved === 1 ? '' : 's'} moved to Miscellaneous — still unsaved`
+      : 'Nothing to move', moved ? 'success' : 'info');
+  }, [queue, draft, showSnack]);
 
   const discardDraft = () => {
     setDraft(null);
@@ -3857,7 +3971,7 @@ export default function App() {
                   Drop a statement to read it
                 </Typography>
                 <Typography sx={{ fontSize: 11.5, color: C.inkMute }}>
-                  PDF or CSV — nothing is posted until you save each row
+                  PDF, CSV or photo — nothing is posted until you save each row
                 </Typography>
               </Box>
             ) : null}
@@ -3868,6 +3982,8 @@ export default function App() {
                            onSuggest={loadIntoComposer}
                            onReopenDraft={reopenDraft} onBulkEdit={bulkEdit}
                            onStatementAccount={retryStatementWithAccount}
+                           onStatementBulk={applyMiscToQueue}
+                           activeQueueSource={queue?.source ?? null}
                            busy={posting || isLoading} />
                 ))}
                 {isLoading ? (
@@ -3940,7 +4056,7 @@ export default function App() {
                       '& .MuiInputBase-input::placeholder': { color: C.inkMute, opacity: 1 },
                     }}
                   />
-                  <Tooltip title="Read a bank or card statement (PDF, CSV)">
+                  <Tooltip title="Read a bank or card statement (PDF, CSV, photo)">
                     <span>
                       <IconButton
                         onClick={() => fileRef.current?.click()}

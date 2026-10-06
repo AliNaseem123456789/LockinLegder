@@ -395,6 +395,23 @@ DEFAULT_BANK_ACC = (os.getenv("DEFAULT_BANK_ACC") or "").strip()
 DEFAULT_REVENUE_ACC = (os.getenv("DEFAULT_REVENUE_ACC") or "").strip()
 DEFAULT_EXPENSE_ACC = (os.getenv("DEFAULT_EXPENSE_ACC") or "").strip()
 
+# A line that names no customer/vendor at all goes to this ONE shared profile
+# instead of stopping. A name that IS in the line but isn't in the ledger still
+# becomes its own new profile. 'O' = Other; set UNKNOWN_PARTY_TYPE=P in .env if
+# you would rather it be a vendor.
+UNKNOWN_PARTY_NAME = os.getenv("UNKNOWN_PARTY_NAME", "Unknown")
+UNKNOWN_PARTY_TYPE = os.getenv("UNKNOWN_PARTY_TYPE", "O")
+
+# Miscellaneous - where a category that matches nothing goes. CPV charts
+# normally have one; CRV charts often don't. With AUTO_CREATE_MISC on (the
+# default) the first line that needs one adds it to that company's chart as a
+# top-level account under REVENUE / EXPENSES - once, then it is reused. Set
+# AUTO_CREATE_MISC=0 to never write to the chart on its own; the operator is
+# then offered the "add income category Miscellaneous Income" command instead.
+AUTO_CREATE_MISC = os.getenv("AUTO_CREATE_MISC", "1") != "0"
+MISC_INCOME_NAME = os.getenv("MISC_INCOME_NAME", "Miscellaneous Income")
+MISC_EXPENSE_NAME = os.getenv("MISC_EXPENSE_NAME", "Miscellaneous Expense")
+
 # acc_trans_m flags.  PHP defaults include_in_billing to the form checkbox
 # (unchecked = 0); v4 hardcoded 1.  Kept configurable so billing reports do
 # not change under you without a decision.
@@ -1071,8 +1088,27 @@ def _rule_based_extract(message: str) -> Dict[str, Any]:
         filled[open_role] = _clean_segment(msg[open_at:])
 
     party = filled.get('party') or ''
+    if not party and filled:
+        # "Paid John 450 for rent" has no "to", but the words between the verb
+        # and the first marker are still the name. "Paid $450 for printing"
+        # leaves nothing once the amount is stripped - no name in the line,
+        # which is the Unknown case. (This used to fall through to the block
+        # below and invent a party like "For Printing From Bofa".)
+        verb = (_CPV_VERBS if entry_type == 'CPV' else _CRV_VERBS).search(msg)
+        first = None
+        for mk in _MARKER_RE.finditer(msg):
+            w = re.sub(r'\s+', ' ', mk.group(1).lower())
+            if role_of.get(w) is None:
+                continue
+            if role_of[w] == 'category' and re.match(r'\s*[\$£€]?\s*\d', msg[mk.end():]):
+                continue
+            first = mk
+            break
+        if verb and first and verb.end() <= first.start():
+            lead = _clean_segment(msg[verb.end():first.start()])
+            party = _clean_segment(_strip_standalone_numbers(lead.replace(',', ' ')))
     # Statement style with no prepositions: "06/04/2026 ACH DEPOSIT - JOHN SMITH 659.25"
-    if not party:
+    elif not party:
         body = _clean_segment(_CPV_VERBS.sub(' ', _CRV_VERBS.sub(' ', msg)))
         if '-' in body or '–' in body:
             tail = re.split(r'[-–]', body)[-1]
@@ -1082,6 +1118,10 @@ def _rule_based_extract(message: str) -> Dict[str, Any]:
         party = re.sub(r'\b(ach|eft|wire|transfer|payment|deposit|debit|credit)\b',
                        ' ', party, flags=re.IGNORECASE)
         party = _clean_segment(party)
+
+    # A "name" with no letters in it is an amount or a reference, not a name.
+    if party and not re.search(r'[A-Za-z]{2}', party):
+        party = ''
 
     out: Dict[str, Any] = {
         "action": "create_transaction",
@@ -1104,8 +1144,8 @@ def _rule_based_extract(message: str) -> Dict[str, Any]:
     if chq:
         out["cheque_number"] = chq.group(1)
 
-    if not out["party_name"]:
-        return {"action": "help"}
+    # No name is no longer a reason to give up - the voucher is filed under
+    # the shared Unknown profile in _process_once.
     return out
 
 
@@ -1208,26 +1248,31 @@ _STMT_MONEY_RE = re.compile(r'\d[\d,]*\.\d{2}')
 
 # Section headings on a checking statement, and what each one means. Order
 # matters only in that the first match wins on a given line.
+# Word gaps in headings are \s* rather than \s+: OCR of a scanned page
+# sometimes runs two words together ("ELECTRONICWITHDRAWALS"), and a
+# missed heading leaves the rows under it in the PREVIOUS section's
+# direction - withdrawals read as deposits. _stmt_is_heading still
+# requires a short all-caps line, so this doesn't widen into prose.
 _STMT_SECTIONS: List[Tuple[re.Pattern, Optional[str], str]] = [
-    (re.compile(r'\bDEPOSITS?\s+AND\s+ADDITIONS?\b', re.I), 'CRV', 'Deposits and additions'),
+    (re.compile(r'\bDEPOSITS?\s*AND\s*ADDITIONS?\b', re.I), 'CRV', 'Deposits and additions'),
     (re.compile(r'\bDEPOSITS?\b(?!\s+and\s+withdrawal)', re.I), 'CRV', 'Deposits'),
-    (re.compile(r'\bELECTRONIC\s+WITHDRAWALS?\b', re.I), 'CPV', 'Electronic withdrawals'),
-    (re.compile(r'\bATM\s*&?\s*DEBIT\s+CARD\s+WITHDRAWALS?\b', re.I), 'CPV', 'Card withdrawals'),
-    (re.compile(r'\bOTHER\s+WITHDRAWALS?\b', re.I), 'CPV', 'Other withdrawals'),
-    (re.compile(r'\bCHECKS?\s+PAID\b', re.I), 'CPV', 'Checks paid'),
-    (re.compile(r'\bWITHDRAWALS?\s+AND\s+DEBITS?\b', re.I), 'CPV', 'Withdrawals'),
-    (re.compile(r'\bFEES?(?:\s+AND\s+CHARGES?)?\s*$', re.I), 'CPV', 'Fees'),
-    (re.compile(r'\bACCOUNT\s+ACTIVITY\b', re.I), None, 'Card activity'),
+    (re.compile(r'\bELECTRONIC\s*WITHDRAWALS?\b', re.I), 'CPV', 'Electronic withdrawals'),
+    (re.compile(r'\bATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?\b', re.I), 'CPV', 'Card withdrawals'),
+    (re.compile(r'\bOTHER\s*WITHDRAWALS?\b', re.I), 'CPV', 'Other withdrawals'),
+    (re.compile(r'\bCHECKS?\s*PAID\b', re.I), 'CPV', 'Checks paid'),
+    (re.compile(r'\bWITHDRAWALS?\s*AND\s*DEBITS?\b', re.I), 'CPV', 'Withdrawals'),
+    (re.compile(r'\bFEES?(?:\s*AND\s*CHARGES?)?\s*$', re.I), 'CPV', 'Fees'),
+    (re.compile(r'\bACCOUNT\s*ACTIVITY\b', re.I), None, 'Card activity'),
     (re.compile(r'\bTRANSACTIONS?\b\s*$', re.I), None, 'Transactions'),
 ]
 
 # Headings that END the transaction part of the page. A running-balance table
 # is full of dates and amounts and would otherwise read as 30 more vouchers.
 _STMT_STOP_RE = re.compile(
-    r'\b(DAILY\s+ENDING\s+BALANCE|ENDING\s+BALANCE|CHECKING\s+SUMMARY|'
-    r'ATM\s*&?\s*DEBIT\s+CARD\s+SUMMARY|INTEREST\s+CHARGES?|'
-    r'ACCOUNT\s+SUMMARY|SUMMARY\s+OF\s+ACCOUNT|IN\s+CASE\s+OF\s+ERRORS|'
-    r'YEAR-TO-DATE|Totals\s+Year-to-Date)\b', re.I)
+    r'\b(DAILY\s*ENDING\s*BALANCE|ENDING\s*BALANCE|CHECKING\s*SUMMARY|'
+    r'ATM\s*&?\s*DEBIT\s*CARD\s*SUMMARY|INTEREST\s*CHARGES?|'
+    r'ACCOUNT\s*SUMMARY|SUMMARY\s*OF\s*ACCOUNT|IN\s*CASE\s*OF\s*ERRORS|'
+    r'YEAR-TO-DATE|Totals\s*Year-to-Date)\b', re.I)
 
 # Lines inside a section that are totals, not transactions.
 _STMT_TOTAL_RE = re.compile(r'^\s*(total|subtotal|beginning|ending|previous)\b', re.I)
@@ -2638,6 +2683,12 @@ def transactionable_account(conn, code: Any) -> bool:
 # --------------------------------------------------------------------------
 # Resolution
 # --------------------------------------------------------------------------
+# A match of one of these kinds is taken as read; anything else scoring under
+# 0.90 (fuzzy, the model, the concept net) is shown as a guess.
+_CONFIDENT_MATCHES = ('exact', 'code', 'default', 'substring_number',
+                      'statement_number')
+
+
 class Resolution:
     """A resolved, POSTABLE account."""
 
@@ -2960,6 +3011,94 @@ def _default_bank_resolution(conn) -> Tuple[Optional[Resolution], Optional[str]]
                   "in the line with into / from / on bank.")
 
 
+# --------------------------------------------------------------------------
+# Miscellaneous, for both sides.
+#
+# One definition of "the misc account", used by the default leg, the
+# suggestion ladder and the statement reader alike - they used to disagree
+# (one matched "misc", the other only "miscellaneous"), so the ladder could
+# leave out the very account the line had just been filed under.
+# --------------------------------------------------------------------------
+_MISC_RE = re.compile(r'\bmiscellaneous\b|\bmisc\b', re.I)
+_OTHER_INCOME_RE = re.compile(r'\bother\s+(?:income|revenue)\b', re.I)
+
+
+def _misc_name(entry_type: str) -> str:
+    return MISC_INCOME_NAME if entry_type == 'CRV' else MISC_EXPENSE_NAME
+
+
+def _misc_nature(entry_type: str) -> str:
+    return NATURE_REVENUE if entry_type == 'CRV' else NATURE_EXPENSE
+
+
+def _natures_for(entry_type: str) -> set:
+    return CRV_INCOME_NATURES if entry_type == 'CRV' else CPV_EXPENSE_NATURES
+
+
+def find_misc_account(conn, entry_type: str,
+                      natures: Optional[set] = None) -> Optional[Dict]:
+    """The postable Miscellaneous account for this side, if the chart has one.
+    Never writes. Prefers the main nature (Expenses over COGS) and the
+    shortest name ("Miscellaneous" over "Miscellaneous - Office Sundries");
+    on the income side "Other Income" counts when there is no misc."""
+    rows = chart_by_nature(conn, natures or _natures_for(entry_type))
+    primary = _misc_nature(entry_type)
+    rows = sorted(rows, key=lambda r: (r['nature'] != primary, len(r['desc'] or '')))
+    for r in rows:
+        if _MISC_RE.search(r['desc'] or ''):
+            return r
+    if entry_type == 'CRV':
+        for r in rows:
+            if _OTHER_INCOME_RE.search(r['desc'] or ''):
+                return r
+    return None
+
+
+_MISC_LOCK = None
+
+
+def ensure_misc_account(conn, entry_type: str,
+                        natures: Optional[set] = None) -> Tuple[Optional[Dict], bool]:
+    """
+    (row, created_now). Finds the Miscellaneous account and, when there isn't
+    one and AUTO_CREATE_MISC is on, adds "Miscellaneous Income" (CRV) or
+    "Miscellaneous Expense" (CPV) to THIS company's chart as a top-level
+    account and returns it.
+
+    This is the one write a preview can make, on purpose: it happens once per
+    company and side, it is a chart account rather than a voucher, and an
+    unused Miscellaneous account is harmless - whereas a ladder whose third
+    rung is missing is the thing that was asked to be fixed.
+    """
+    global _MISC_LOCK
+    natures = natures or _natures_for(entry_type)
+    row = find_misc_account(conn, entry_type, natures)
+    if row or not AUTO_CREATE_MISC:
+        return row, False
+    if _MISC_LOCK is None:
+        import threading
+        _MISC_LOCK = threading.Lock()
+    with _MISC_LOCK:
+        row = find_misc_account(conn, entry_type, natures)      # another request won
+        if row:
+            return row, False
+        name, nature = _misc_name(entry_type), _misc_nature(entry_type)
+        if nature not in natures:
+            return None, False
+        try:
+            made = add_chart_account(conn, 'main', name, nature)
+        except Exception as e:
+            # Typically: it exists but is switched off, or is a heading.
+            print(f"[misc] could not add \"{name}\" for company {_sid()}: {e}")
+            return None, False
+        row = find_account(conn, made['code'])
+        if not row or row['nature'] not in natures:
+            row = find_misc_account(conn, entry_type, natures)
+        print(f"[misc] company {_sid()}: added {made['code']} {name} "
+              f"(postable={'yes' if row else 'NO - check v_trans_accounts_m2'})")
+        return row, row is not None
+
+
 def _default_category_resolution(conn, entry_type: str,
                                  natures: set) -> Tuple[Optional[Resolution], Optional[str]]:
     configured = DEFAULT_REVENUE_ACC if entry_type == 'CRV' else DEFAULT_EXPENSE_ACC
@@ -2971,9 +3110,11 @@ def _default_category_resolution(conn, entry_type: str,
     candidates = chart_by_nature(conn, natures)
     if not candidates:
         return None, None
-    for row in candidates:
-        if 'miscellaneous' in row['desc'].lower():
-            return Resolution(row, 'default', 0.0), None
+    misc, created = ensure_misc_account(conn, entry_type, natures)
+    if misc:
+        res = Resolution(misc, 'default', 0.0)
+        res.just_created = created
+        return res, None
 
     kind = 'revenue' if entry_type == 'CRV' else 'expense'
     names = _sample_accounts(conn, natures)
@@ -3220,7 +3361,9 @@ def _category_suggestions(conn, search_text: str, natures: set,
     """
     out: Dict[str, Any] = {'close': [], 'heading': None,
                            'create': _proposed_category_name(search_text),
-                           'misc': None, 'kind': 'income' if entry_type == 'CRV'
+                           'misc': None, 'misc_created': False,
+                           'misc_name': _misc_name(entry_type),
+                           'kind': 'income' if entry_type == 'CRV'
                            else 'expense'}
     if not search_text or not search_text.strip():
         return out
@@ -3236,6 +3379,16 @@ def _category_suggestions(conn, search_text: str, natures: set,
             scored.append((s, name_similarity(search_text, r['desc']), r))
     scored.sort(key=lambda x: (-x[0], -x[1], len(x[2]['desc'])))
     out['close'] = [r for _s, _f, r in scored[:3]]
+    out['close_loose'] = False
+    if not out['close'] and postable:
+        # No shared word at all ("zebra grooming"). Still offer the nearest
+        # by spelling, so "use an existing account" is always a choice - but
+        # say plainly they're only the nearest, not a match.
+        fuzzy = sorted(((name_similarity(search_text, r['desc']), r) for r in postable
+                        if not _MISC_RE.search(r['desc'] or '')),
+                       key=lambda x: (-x[0], len(x[1]['desc'])))
+        out['close'] = [r for _f, r in fuzzy[:2]]
+        out['close_loose'] = bool(out['close'])
 
     # --- 2. a heading that covers this, with no child that does -----------
     #
@@ -3256,6 +3409,11 @@ def _category_suggestions(conn, search_text: str, natures: set,
             distinguishing = _significant_words(search_text) - _significant_words(m['name'])
             if not distinguishing:
                 continue          # they named the heading itself, nothing to add
+            if not m['subs']:
+                # A plain account, not a heading. Adding under it would turn
+                # it into one; rung 1 already offers it and rung "create"
+                # offers a new top-level account, which is what's wanted.
+                continue
             if any(distinguishing & _significant_words(s['name']) for s in m['subs']):
                 continue          # a child already covers it; rung 1 offered it
             if m['postable'] and _main_has_transactions(conn, m['code']) \
@@ -3287,37 +3445,67 @@ def _category_suggestions(conn, search_text: str, natures: set,
             break
 
     # --- 3. somewhere to put it that always exists ------------------------
-    for r in postable:
-        if 'miscellaneous' in (r['desc'] or '').lower():
-            out['misc'] = r
-            break
+    # Created on first need (AUTO_CREATE_MISC), so this rung is there for
+    # CRV as well as CPV. Kept out of the close list so it isn't offered twice.
+    out['misc'], out['misc_created'] = ensure_misc_account(conn, entry_type, natures)
+    if out['misc']:
+        out['close'] = [r for r in out['close'] if r['code'] != out['misc']['code']]
     return out
 
 
 def _category_help_text(sug: Dict[str, Any], picked: Optional[str] = None) -> str:
-    """The ladder, as the person reads it."""
+    """
+    The ladder, as the person reads it - always the same three choices, in
+    the order a bookkeeper would think of them:
+
+      1. the closest account already in the chart
+      2. create a new account for it
+      3. Miscellaneous
+
+    `picked` is what the panel has been filled with for now; it is marked
+    rather than left out, so the person can see which of the three is live.
+    """
     kind = sug['kind']
-    lines: List[str] = []
-    if sug['close'] and not picked:
-        lines.append("Closest in your chart")
-        lines += [f"  {r['qualified']}" for r in sug['close']]
-    elif sug['close'] and len(sug['close']) > 1:
-        lines.append("Or one of these")
-        lines += [f"  {r['qualified']}" for r in sug['close']
-                  if r['qualified'] != picked]
+    using = "   <- using this for now"
+    opts: List[List[str]] = []
+
+    if sug['close']:
+        body = [("Use an existing account - nothing in your chart is really "
+                 "close, these are the nearest (or type \"show chart\"):")
+                if sug.get('close_loose') else
+                "Use the closest account in your chart:"]
+        body += [f"     {r['qualified']}{using if r['qualified'] == picked else ''}"
+                 for r in sug['close']]
+        opts.append(body)
+
     if sug['heading']:
         h = sug['heading']
-        lines += ["",
-                  f"\"{h['name']}\" is a heading with {h['sub_count']} "
-                  f"account{'' if h['sub_count'] == 1 else 's'} under it"
-                  + (f" ({', '.join(h['subs'])})" if h['subs'] else "")
-                  + f", and none of them covers this. Add one:",
-                  f"  add category {h['child']} under {h['name']}"]
-    else:
-        lines += ["", "Don't have it yet? Create the category:",
-                  f"  add {kind} category {sug['create']}"]
+        opts.append([
+            f"Create a new account for it. \"{h['name']}\" has {h['sub_count']} "
+            f"account{'' if h['sub_count'] == 1 else 's'} under it"
+            + (f" ({', '.join(h['subs'])})" if h['subs'] else "")
+            + " and none of them covers this:",
+            f"     add category {h['child']} under {h['name']}"])
+    elif sug.get('create'):
+        opts.append(["Create a new account for it:",
+                     f"     add {kind} category {sug['create']}"])
+
     if sug['misc']:
-        lines += ["", f"Or file it under {sug['misc']['qualified']}."]
+        m = sug['misc']['qualified']
+        line = f"Put it under Miscellaneous: {m}{using if m == picked else ''}"
+        if sug.get('misc_created'):
+            line += (f"\n     (your chart had no Miscellaneous {kind} account, "
+                     f"so I added this one)")
+        opts.append([line])
+    elif sug.get('misc_name'):
+        opts.append([f"Put it under Miscellaneous - you don't have one yet:",
+                     f"     add {kind} category {sug['misc_name']}"])
+
+    lines: List[str] = []
+    for i, body in enumerate(opts, start=1):
+        lines.append(f"{i}. {body[0]}")
+        lines += body[1:]
+        lines.append("")
     return "\n".join(lines).strip()
 
 
@@ -3337,12 +3525,14 @@ def _category_suggestion_lines(msg: str, sug: Dict[str, Any],
     if sug['heading']:
         h = sug['heading']
         out.append(f"add category {h['child']} under {h['name']}")
-    else:
+    elif sug.get('create'):
         out.append(f"add {sug['kind']} category {sug['create']}")
     if sug['misc']:
         line = _line_with_category(msg, sug['misc']['desc'], entry_type)
         if line not in out:
             out.append(line)
+    elif sug.get('misc_name'):
+        out.append(f"add {sug['kind']} category {sug['misc_name']}")
     return out[:4]
 
 
@@ -3937,7 +4127,40 @@ def _next_party_code(cur, p_type: str) -> str:
     return str(max(seed, current + 1))
 
 
+def _is_unknown_name(name: Optional[str]) -> bool:
+    return normalize_name(name or '') == normalize_name(UNKNOWN_PARTY_NAME)
+
+
+def find_unknown_party(conn) -> Optional[str]:
+    """The shared Unknown profile's code, if it exists yet. Never writes."""
+    for p in find_party_candidates(conn, UNKNOWN_PARTY_NAME, limit=20):
+        for cand in (p.get('company_name'), p.get('person_name')):
+            if _is_unknown_name(cand):
+                return str(p['p_code'])
+    return None
+
+
+def get_or_create_unknown_party(conn) -> Tuple[str, str]:
+    code = find_unknown_party(conn)
+    if code:
+        return code, UNKNOWN_PARTY_NAME
+    cur = conn.cursor()
+    new_code = _next_party_code(cur, UNKNOWN_PARTY_TYPE)
+    cur.execute("INSERT INTO acc_party (p_code, p_type, company_name, person_name, "
+                "status, system_id) VALUES (%s, %s, %s, %s, 1, %s)",
+                (new_code, UNKNOWN_PARTY_TYPE, UNKNOWN_PARTY_NAME,
+                 UNKNOWN_PARTY_NAME, _sid()))
+    conn.commit()
+    cur.close()
+    print(f"[profile] created shared {UNKNOWN_PARTY_NAME} profile {new_code}")
+    return new_code, UNKNOWN_PARTY_NAME
+
+
 def create_party(conn, name: str, p_type: str) -> Tuple[str, str]:
+    # Every "Unknown" lands on the ONE shared profile, whether it came from a
+    # CRV or a CPV - otherwise the per-type dedup below would make two.
+    if _is_unknown_name(name):
+        return get_or_create_unknown_party(conn)
     display_name = title_case_name(name)
     target_norm = normalize_name(display_name)
 
@@ -4729,6 +4952,8 @@ IMPORTANT RULES:
    of a bank account, like "Bank of America 9523"), you MUST keep that number. It
    distinguishes it from similarly-named accounts. Never drop it.
    - "Bank of America 9523 JOHN SMITH 3435.6" -> bank_text: "Bank of America 9523"
+7. If the message names no customer or vendor, OMIT party_name. Never use the
+   description, the category or the bank as a name.
 
 Return ONLY valid JSON with these fields:
 - action: "create_transaction", "help", "financial_analysis", "query_records", or "error"
@@ -4809,8 +5034,7 @@ Return ONLY valid JSON, no markdown, no extra text.
             llm_error = "model calls paused after repeated failures"
 
         llm_ok = (llm.get('action') == 'create_transaction'
-                  and llm.get('entry_type') and llm.get('amount')
-                  and llm.get('party_name'))
+                  and llm.get('entry_type') and llm.get('amount'))
         rules_ok = rules.get('action') == 'create_transaction'
 
         # Statement line with no in/out signal: accept an LLM direction if we
@@ -5877,7 +6101,7 @@ Return ONLY valid JSON, no markdown, no extra text.
                              'filename': filename}}
 
         return self._statement_reply(drafts, skipped, bank_res=bank_res,
-                                     parsed=parsed, filename=filename)
+                                     parsed=parsed, filename=filename, conn=conn)
 
     def _statement_row_draft(self, conn, r: 'StatementRow', *, bank_res,
                              existing: List[Dict], index: int,
@@ -5903,7 +6127,13 @@ Return ONLY valid JSON, no markdown, no extra text.
                 party_display = title_case_name(party_name)
                 party_match_type = 'new'
         else:
-            party_display = ''
+            # Nothing on the line names anyone (a fee, a mobile deposit), so it
+            # goes to the shared Unknown profile instead of a blank field.
+            party_code = find_unknown_party(conn)
+            party_display = UNKNOWN_PARTY_NAME
+            party_type = UNKNOWN_PARTY_TYPE
+            party_match_type = 'exact' if party_code else 'new'
+            party_score = 1.0 if party_code else 0.0
 
         # ---- Category leg --------------------------------------------------
         # The description is the only hint there is, and most of the time it
@@ -5920,23 +6150,56 @@ Return ONLY valid JSON, no markdown, no extra text.
                 f"there is nothing to post the other side of this row to.")
         category_matched = cat_res is not None
         cat_note = None
+        cat_guess = None
+        kind = 'income' if r.entry_type == 'CRV' else 'expense'
+        # What happened to this row's account, in one word, so the statement
+        # card can count them and the client can move a whole group at once:
+        #   matched  read off the line with confidence
+        #   guessed  a weak match (fuzzy, the model, the concept net)
+        #   misc     nothing matched - filed under Miscellaneous
+        #   missing  nothing matched and there's no Miscellaneous to use
+        category_status = 'matched'
+
+        # A weak match is a guess, exactly as on a typed line. Before this a
+        # bank memo that the model mapped to SOMETHING was shown as matched,
+        # so nothing ever reached Miscellaneous and nothing said "check me".
+        if cat_res is not None and cat_res.match_type not in _CONFIDENT_MATCHES \
+                and cat_res.score < 0.90:
+            category_matched = False
+            category_status = 'guessed'
+            misc_row = find_misc_account(conn, r.entry_type, natures)
+            cat_guess = AccountProblem(
+                f"Guessed from the statement line - nothing in your chart is "
+                f"named for it. If it's wrong:\n"
+                f"1. pick the right account here\n"
+                f"2. create one: add {kind} category <name>\n"
+                f"3. put it under Miscellaneous"
+                + (f" ({misc_row['qualified']})" if misc_row else "")
+                + " - or use the button on the statement card to move every "
+                  "guess there at once.",
+                "Guessed - check it")
+
         if not cat_res:
             cat_res, _d = _default_category_resolution(conn, r.entry_type, natures)
             if cat_res:
-                cat_note = AccountProblem(
-                    f"Nothing in the line named an account, so this is the "
-                    f"default ({cat_res.qualified}). Change it here if the row "
-                    f"belongs somewhere else.",
-                    "Defaulted - check it")
+                category_status = 'misc'
+                cat_guess = AccountProblem(
+                    f"Nothing in your chart matches this line, so it's under "
+                    f"{cat_res.qualified} for now. To file it properly: pick an "
+                    f"account here, or create one with \"add {kind} category "
+                    f"<name>\".",
+                    "No match - under Miscellaneous")
             else:
+                category_status = 'missing'
                 cat_note = AccountProblem(
-                    "The line doesn't name an account and there's no default "
-                    "set, so pick the one this belongs to.",
+                    "The line doesn't match any account and there's no "
+                    "Miscellaneous account to fall back on, so pick the one "
+                    "this belongs to.",
                     "Not matched - choose it")
 
         review: List[str] = []
         if party_why:
-            review.append(f'no party on this line - {party_why}')
+            review.append(f'no name on this line ({party_why}) - filed under Unknown')
         if statement_is_transfer(r.description):
             # The one reading that is quietly wrong rather than obviously
             # wrong: money moved between two accounts this company already
@@ -5976,27 +6239,41 @@ Return ONLY valid JSON, no markdown, no extra text.
             party_score=party_score, bank_res=bank_res, cat_res=cat_res,
             category_matched=category_matched, cheque_no=None,
             description=r.description[:200], review_items=review,
-            extraction_source='statement', cat_note=cat_note)
+            extraction_source='statement', cat_note=cat_note,
+            cat_guess=cat_guess)
 
         d = payload['draft']
+        d['category_status'] = category_status
         d['draft_id'] = f"stmt-{index}"
         d['statement_line'] = r.line_no
         d['statement_section'] = r.section
         d['statement_text'] = r.description
         d['statement_file'] = filename
         d['duplicate_of'] = dup['voucher_number'] if dup else None
-        # An unnamed party is a field to fill, not a name to post. Clearing it
-        # here stops the commit creating a profile called "(no name on the
-        # line)" if someone saves the row without looking.
-        if not party_name:
-            d['party_name'] = None
-            d['party_is_new'] = False
         return d
 
     def _statement_reply(self, drafts: List[Dict], skipped: List[Dict], *,
-                         bank_res, parsed: Dict, filename: str) -> Dict:
+                         bank_res, parsed: Dict, filename: str,
+                         conn=None) -> Dict:
         crv = [d for d in drafts if d['entry_type'] == 'CRV']
         cpv = [d for d in drafts if d['entry_type'] == 'CPV']
+
+        # The Miscellaneous account for each side that has rows, so the card
+        # can offer "put these under Miscellaneous" for the whole file at
+        # once. Created here if missing (AUTO_CREATE_MISC), because a button
+        # that moves sixty rows to an account that doesn't exist yet can't
+        # work - and this is the moment someone is about to press it.
+        misc_accounts: Dict[str, Any] = {}
+        if conn is not None:
+            for et, group in (('CRV', crv), ('CPV', cpv)):
+                if not group:
+                    continue
+                row, _new = ensure_misc_account(conn, et)
+                if row:
+                    misc_accounts[et] = {'code': row['code'],
+                                         'qualified': row['qualified']}
+        counts = {k: sum(1 for d in drafts if d.get('category_status') == k)
+                  for k in ('matched', 'guessed', 'misc', 'missing')}
         money_in = sum(d['amount'] for d in crv)
         money_out = sum(d['amount'] for d in cpv)
         needs = [d for d in drafts if not d.get('category_acc_code')
@@ -6021,6 +6298,21 @@ Return ONLY valid JSON, no markdown, no extra text.
             lines += ["", f"{len(new_parties)} name{'' if len(new_parties) == 1 else 's'} "
                           f"aren't in your ledger yet; each one gets a profile "
                           f"when you save that row."]
+        if counts['guessed'] or counts['misc']:
+            bits = []
+            if counts['matched']:
+                bits.append(f"{counts['matched']} matched an account")
+            if counts['guessed']:
+                bits.append(f"{counts['guessed']} "
+                            + ("is a guess" if counts['guessed'] == 1 else "are guesses")
+                            + " to check")
+            if counts['misc']:
+                bits.append(f"{counts['misc']} matched nothing and are under "
+                            f"Miscellaneous")
+            lines += ["", "Accounts: " + ", ".join(bits) + "."
+                      + (" The card below can move the guesses - or every "
+                         "row - to Miscellaneous in one go."
+                         if counts['guessed'] or counts['matched'] else "")]
         if needs:
             lines += ["", f"{len(needs)} row{'' if len(needs) == 1 else 's'} still "
                           f"need an account picking."]
@@ -6055,6 +6347,8 @@ Return ONLY valid JSON, no markdown, no extra text.
                 'crv_count': len(crv), 'cpv_count': len(cpv),
                 'money_in': money_in, 'money_out': money_out,
                 'needs_account': len(needs),
+                'category_counts': counts,
+                'misc_accounts': misc_accounts,
                 'duplicates': len(dups),
                 'new_parties': new_parties,
                 'skipped': skipped,
@@ -6458,6 +6752,12 @@ Return ONLY valid JSON, no markdown, no extra text.
         entry_type = extracted.get('entry_type')
         amount = extracted.get('amount')
         party_name = extracted.get('party_name')
+        # No name anywhere in the line: file it under the shared Unknown profile
+        # rather than refusing. A name that IS there but isn't in the ledger
+        # still becomes its own new profile.
+        party_defaulted = False
+        if not str(party_name or '').strip() and entry_type and amount is not None:
+            party_name, party_defaulted = UNKNOWN_PARTY_NAME, True
         description = extracted.get('description') or (
             'Receipt Voucher' if entry_type == 'CRV' else 'Payment Voucher')
 
@@ -6500,6 +6800,8 @@ Return ONLY valid JSON, no markdown, no extra text.
             cheque_no = chq.group(1) if chq else None
 
         review_items = []
+        if party_defaulted:
+            review_items.append('no name in the line - filed under Unknown')
 
         try:
             # ---- Fiscal year ----
@@ -6618,6 +6920,33 @@ Return ONLY valid JSON, no markdown, no extra text.
                      f"Chosen because it was {because}."),
                     f"Guessed from \"{category_hint}\" - check it")
 
+            # Named, but nothing in the chart matches it - exact, fuzzy, the
+            # model and the synonym net have all had their turn inside
+            # resolve_category_account. File it under Miscellaneous instead of
+            # leaving it blank, and flag it so it gets checked before saving.
+            #
+            # Preview only: a direct post (preview=false) has nobody to show
+            # the choice to, so it asks instead - see the branch below.
+            if cat_res is None and cat_err and preview:
+                misc_row, misc_new = ensure_misc_account(conn, entry_type, natures)
+                if misc_row:
+                    misc = Resolution(misc_row, 'default', 0.0)
+                    if cat_sug is not None:
+                        cat_sug['misc'] = misc_row
+                        cat_sug['misc_created'] = cat_sug.get('misc_created') or misc_new
+                    cat_res, category_matched = misc, False
+                    # cat_note still held the "nothing matches" error from
+                    # above, and the draft read that as "category missing" -
+                    # so the panel showed it empty although it had been filled.
+                    cat_note = None
+                    cat_guess = AccountProblem(
+                        f"Nothing in your chart matches \"{category_hint}\", so for "
+                        f"now it's under {misc.qualified}. Pick one of these, or "
+                        f"change it in the panel:"
+                        + ("\n\n" + _category_help_text(cat_sug, picked=misc.qualified)
+                           if cat_sug else ""),
+                        "No match - under Miscellaneous for now")
+
             if cat_res is None and cat_err and not preview:
                 # A named category that matches nothing must never be silently
                 # rerouted somewhere else on a direct post.
@@ -6647,6 +6976,14 @@ Return ONLY valid JSON, no markdown, no extra text.
                     cat_res, default_err = _default_category_resolution(
                         conn, entry_type, natures)
                     category_matched = False
+                    if cat_res is not None and getattr(cat_res, 'just_created', False):
+                        kind = 'income' if entry_type == 'CRV' else 'expense'
+                        cat_guess = AccountProblem(
+                            f"The line doesn't say what this was for, so it's under "
+                            f"{cat_res.qualified}. Your chart had no Miscellaneous "
+                            f"{kind} account, so I added this one. Change it in the "
+                            f"panel if it belongs somewhere else.",
+                            "Not named - under Miscellaneous")
                     if not cat_res:
                         t = default_err or "Could not determine the category account."
                         cat_suggestions = [_line_with_category(msg, n, entry_type)
@@ -7970,35 +8307,322 @@ async def api_commit_voucher(payload: VoucherCommit):
 # to a failure. Layout mode matters more than it looks: the section heading a
 # row sits under is the only thing that says which way the money went, and a
 # reader that reflows the page loses it.
+#
+# IMAGES INSIDE THE PDF (OCR)
+#
+# A text reader sees only real text. A scanned statement, a phone photo saved
+# as PDF, or a statement with one page pasted in as a picture has nothing for
+# it to find on those pages. So the PDF is read PAGE BY PAGE:
+#
+#   * a page with real text keeps it, exactly as before;
+#   * a page with (almost) no text is rendered to an image and OCR'd whole;
+#   * a page that has text AND a large picture on it (a receipt or a cropped
+#     statement pasted into a document) keeps its text and gets the picture
+#     OCR'd and added underneath.
+#
+# OCR output goes through the same layout rebuild for every engine - words
+# are put back on their lines and spaced out by their x position - so the
+# statement parser sees the same column shape that pdftotext -layout gives.
+#
+# Engines, first one that works wins:
+#   1. Tesseract via pytesseract   (needs the tesseract program installed)
+#   2. RapidOCR                     (pip only - no system install at all)
+# Neither installed: text PDFs read exactly as before, and an image-only page
+# gets a message saying what to install instead of "no text found".
 # --------------------------------------------------------------------------
 STATEMENT_MAX_BYTES = int(os.getenv("STATEMENT_MAX_BYTES", str(15 * 1024 * 1024)))
+
+PDF_OCR = os.getenv("PDF_OCR", "1") != "0"
+OCR_DPI = int(os.getenv("OCR_DPI", "300"))
+OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "40"))
+OCR_LANG = os.getenv("OCR_LANG", "eng")
+# A page with fewer real characters than this is treated as an image.
+OCR_MIN_PAGE_CHARS = int(os.getenv("OCR_MIN_PAGE_CHARS", "40"))
+# A picture covering at least this share of a text page gets OCR'd too.
+# Logos and signatures are far below it.
+OCR_MIN_IMAGE_SHARE = float(os.getenv("OCR_MIN_IMAGE_SHARE", "0.12"))
+# Windows: point this at tesseract.exe if it isn't on PATH, e.g.
+#   TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip()
+
+_OCR_ENGINE: Optional[Tuple[str, Any]] = None     # (name, callable) once found
+_OCR_ENGINE_TRIED = False
+
+
+def _ocr_engine() -> Optional[Tuple[str, Any]]:
+    """The first OCR engine that actually runs on this machine, found once.
+    Each engine is a function PIL.Image -> list of (x0, y0, x1, y1, text)."""
+    global _OCR_ENGINE, _OCR_ENGINE_TRIED
+    if _OCR_ENGINE_TRIED:
+        return _OCR_ENGINE
+    _OCR_ENGINE_TRIED = True
+    if not PDF_OCR:
+        return None
+
+    try:
+        import pytesseract
+        if TESSERACT_CMD:
+            pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+        elif os.name == 'nt':
+            default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            if os.path.exists(default):
+                pytesseract.pytesseract.tesseract_cmd = default
+        pytesseract.get_tesseract_version()       # raises if the program is missing
+
+        def _tess(img):
+            d = pytesseract.image_to_data(
+                img, lang=OCR_LANG, config='--psm 6',
+                output_type=pytesseract.Output.DICT)
+            boxes = []
+            for i, word in enumerate(d['text']):
+                word = (word or '').strip()
+                try:
+                    conf = float(d['conf'][i])
+                except (TypeError, ValueError):
+                    conf = -1
+                if not word or conf < 0:
+                    continue
+                x, y, w, h = d['left'][i], d['top'][i], d['width'][i], d['height'][i]
+                boxes.append((x, y, x + w, y + h, word))
+            return boxes
+
+        _OCR_ENGINE = ('tesseract', _tess)
+        print("[ocr] using Tesseract")
+        return _OCR_ENGINE
+    except Exception as e:
+        print(f"[ocr] tesseract not available: {e}")
+
+    try:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            from rapidocr import RapidOCR
+        _rapid = RapidOCR()
+
+        def _rapid_ocr(img):
+            import numpy as np
+            res = _rapid(np.array(img.convert('RGB')))
+            # rapidocr_onnxruntime -> (list, elapsed); rapidocr >= 2 -> object
+            items = res[0] if isinstance(res, tuple) else None
+            if items is None and hasattr(res, 'boxes'):
+                items = list(zip(res.boxes or [], res.txts or [], res.scores or []))
+            boxes = []
+            for it in items or []:
+                pts, text = it[0], it[1]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                if str(text).strip():
+                    boxes.append((min(xs), min(ys), max(xs), max(ys), str(text).strip()))
+            return boxes
+
+        _OCR_ENGINE = ('rapidocr', _rapid_ocr)
+        print("[ocr] using RapidOCR")
+        return _OCR_ENGINE
+    except Exception as e:
+        print(f"[ocr] rapidocr not available: {e}")
+
+    print("[ocr] no OCR engine installed - image-only PDF pages can't be read. "
+          "pip install rapidocr-onnxruntime   (or install Tesseract + pytesseract)")
+    return None
+
+
+def _boxes_to_layout_text(boxes: List[Tuple[float, float, float, float, str]]) -> str:
+    """
+    Word boxes back into lines of text, spaced like pdftotext -layout.
+
+    Lines: a box joins the line whose vertical middle band it overlaps, so a
+    slightly skewed scan still keeps the date, the description and the amount
+    of one row together. Columns: each box is placed at the character column
+    its x position implies, with at least one space before it - which keeps
+    "08/01" and "$150.00" as separate tokens and the amount last on the line,
+    the two things _STMT_ROW_RE actually relies on.
+    """
+    boxes = [b for b in boxes if b[4]]
+    if not boxes:
+        return ''
+    heights = sorted(b[3] - b[1] for b in boxes)
+    med_h = max(heights[len(heights) // 2], 1)
+
+    # Average width of one character, from the boxes themselves.
+    widths = sorted((b[2] - b[0]) / max(len(b[4]), 1) for b in boxes)
+    char_w = max(widths[len(widths) // 2], 1)
+
+    lines: List[Dict[str, Any]] = []
+    for b in sorted(boxes, key=lambda b: ((b[1] + b[3]) / 2, b[0])):
+        mid = (b[1] + b[3]) / 2
+        for ln in lines:
+            if abs(mid - ln['mid']) <= med_h * 0.55:
+                ln['boxes'].append(b)
+                n = len(ln['boxes'])
+                ln['mid'] = (ln['mid'] * (n - 1) + mid) / n
+                break
+        else:
+            lines.append({'mid': mid, 'boxes': [b]})
+
+    out = []
+    for ln in sorted(lines, key=lambda l: l['mid']):
+        s = ''
+        for b in sorted(ln['boxes'], key=lambda b: b[0]):
+            col = int(round(b[0] / char_w))
+            if s:
+                s += ' ' * max(1, col - len(s))
+            else:
+                s = ' ' * min(col, 40)
+            s += b[4]
+        out.append(s.rstrip())
+    return "\n".join(out)
+
+
+def _ocr_pil(img) -> str:
+    eng = _ocr_engine()
+    if not eng:
+        return ''
+    gray = img.convert('L')
+    # Small pictures (a cropped receipt) OCR badly; bring them up to a size
+    # the engines are tuned for.
+    if gray.width < 1200:
+        scale = 1200 / max(gray.width, 1)
+        gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
+    return _boxes_to_layout_text(eng[1](gray))
+
+
+def _real_chars(text: str) -> int:
+    return len(re.sub(r'\s+', '', text or ''))
+
+
+def _pdf_text_pdfplumber(data: bytes) -> Tuple[str, Dict[str, Any]]:
+    """Page by page, OCR-ing the pages (and pictures) that have no text."""
+    import pdfplumber, io
+    info = {'pages': 0, 'ocr_pages': [], 'ocr_images': 0, 'ocr_missing': False,
+            'ocr_skipped': 0}
+    chunks: List[str] = []
+    ocr_budget = OCR_MAX_PAGES
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        info['pages'] = len(pdf.pages)
+        for num, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text(layout=True) or ''
+            needs_page_ocr = _real_chars(text) < OCR_MIN_PAGE_CHARS
+
+            if needs_page_ocr:
+                if not PDF_OCR:
+                    chunks.append(text)
+                    continue
+                if not _ocr_engine():
+                    info['ocr_missing'] = True
+                    chunks.append(text)
+                    continue
+                if ocr_budget <= 0:
+                    info['ocr_skipped'] += 1
+                    chunks.append(text)
+                    continue
+                ocr_budget -= 1
+                img = page.to_image(resolution=OCR_DPI).original
+                ocr = _ocr_pil(img)
+                if _real_chars(ocr) > _real_chars(text):
+                    text = ocr
+                    info['ocr_pages'].append(num)
+                chunks.append(text)
+                continue
+
+            # Text page - but a big picture on it may hold rows of its own.
+            extra: List[str] = []
+            if PDF_OCR and page.images:
+                page_area = float(page.width * page.height) or 1.0
+                for im in page.images:
+                    x0 = max(float(im.get('x0', 0)), 0.0)
+                    x1 = min(float(im.get('x1', 0)), float(page.width))
+                    top = max(float(im.get('top', 0)), 0.0)
+                    bottom = min(float(im.get('bottom', 0)), float(page.height))
+                    if x1 <= x0 or bottom <= top:
+                        continue
+                    if (x1 - x0) * (bottom - top) / page_area < OCR_MIN_IMAGE_SHARE:
+                        continue
+                    if not _ocr_engine():
+                        info['ocr_missing'] = True
+                        break
+                    if ocr_budget <= 0:
+                        info['ocr_skipped'] += 1
+                        break
+                    ocr_budget -= 1
+                    try:
+                        img = page.crop((x0, top, x1, bottom)).to_image(
+                            resolution=OCR_DPI).original
+                        t = _ocr_pil(img)
+                    except Exception as e:
+                        print(f"[ocr] page {num} picture skipped: {e}")
+                        continue
+                    if t.strip():
+                        extra.append(t)
+                        info['ocr_images'] += 1
+            chunks.append(text + ("\n" + "\n".join(extra) if extra else ''))
+    return "\n".join(chunks), info
+
+
+def _pdf_ocr_pypdfium(data: bytes, info: Dict[str, Any]) -> str:
+    """Whole-document OCR without pdfplumber (pypdfium2 renders the pages)."""
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(data)
+    out = []
+    try:
+        for i in range(min(len(doc), OCR_MAX_PAGES)):
+            img = doc[i].render(scale=OCR_DPI / 72).to_pil()
+            t = _ocr_pil(img)
+            if t.strip():
+                info['ocr_pages'].append(i + 1)
+            out.append(t)
+        info['ocr_skipped'] += max(0, len(doc) - OCR_MAX_PAGES)
+    finally:
+        doc.close()
+    return "\n".join(out)
+
+
+def _reader_label(base: str, info: Dict[str, Any]) -> str:
+    bits = []
+    if info.get('ocr_pages'):
+        bits.append(f"ocr p{','.join(str(p) for p in info['ocr_pages'])}")
+    if info.get('ocr_images'):
+        bits.append(f"ocr {info['ocr_images']} picture(s)")
+    return base + (f" + {'; '.join(bits)}" if bits else '')
 
 
 def _pdf_text(data: bytes) -> Tuple[str, str]:
     """(text, which reader produced it)."""
+    text, reader, _info = _pdf_text_info(data)
+    return text, reader
+
+
+def _pdf_text_info(data: bytes) -> Tuple[str, str, Dict[str, Any]]:
+    """(text, which reader produced it, what OCR did)."""
     errors = []
+    info = {'pages': 0, 'ocr_pages': [], 'ocr_images': 0, 'ocr_missing': False,
+            'ocr_skipped': 0}
 
     try:
-        import pdfplumber, io
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            pages = [p.extract_text(layout=True) or '' for p in pdf.pages]
-        text = "\n".join(pages)
+        text, info = _pdf_text_pdfplumber(data)
         if text.strip():
-            return text, 'pdfplumber'
+            return text, _reader_label('pdfplumber', info), info
         errors.append("pdfplumber found no text")
+    except ImportError as e:
+        errors.append(f"pdfplumber: {e}")
     except Exception as e:
         errors.append(f"pdfplumber: {e}")
 
     try:
         import subprocess, tempfile
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as fh:
-            fh.write(data)
-            fh.flush()
-            out = subprocess.run(['pdftotext', '-layout', fh.name, '-'],
+        fd, path = tempfile.mkstemp(suffix='.pdf')
+        try:
+            with os.fdopen(fd, 'wb') as fh:          # closed before pdftotext opens it (Windows)
+                fh.write(data)
+            out = subprocess.run(['pdftotext', '-layout', path, '-'],
                                  capture_output=True, timeout=60)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         text = out.stdout.decode('utf-8', 'replace')
         if text.strip():
-            return text, 'pdftotext'
+            return text, 'pdftotext', info
         errors.append("pdftotext found no text")
     except Exception as e:
         errors.append(f"pdftotext: {e}")
@@ -8009,34 +8633,114 @@ def _pdf_text(data: bytes) -> Tuple[str, str]:
         reader = PdfReader(io.BytesIO(data))
         text = "\n".join((p.extract_text() or '') for p in reader.pages)
         if text.strip():
-            return text, 'pypdf'
+            return text, 'pypdf', info
         errors.append("pypdf found no text")
     except Exception as e:
         errors.append(f"pypdf: {e}")
 
+    # Nothing had text and pdfplumber wasn't there to OCR page by page.
+    if PDF_OCR and _ocr_engine():
+        try:
+            text = _pdf_ocr_pypdfium(data, info)
+            if text.strip():
+                return text, _reader_label('ocr', info), info
+            errors.append("ocr found no text")
+        except Exception as e:
+            errors.append(f"ocr: {e}")
+
+    no_text = any('no text' in e for e in errors)
+    if no_text and PDF_OCR and not _ocr_engine():
+        raise ValueError(
+            "That PDF is a scan or a photo - the pages are pictures, with no "
+            "text inside them - and the server has no OCR installed to read "
+            "pictures. Install it once and restart:\n"
+            "    pip install rapidocr-onnxruntime\n"
+            "(or install Tesseract and `pip install pytesseract`). Until then, "
+            "download the PDF or CSV from your bank's site instead.")
     raise ValueError(
         "I couldn't get any text out of that PDF. "
-        + ("It's most likely a scan or a photo rather than a statement "
-           "downloaded from the bank - there are no words in the file to "
-           "read, only an image of them. Download the PDF or CSV from your "
-           "bank's site and upload that instead."
-           if any('no text' in e for e in errors) else
+        + ("Even reading the pages as pictures found no words - the scan may "
+           "be too faint, blurred or rotated. Try a clearer scan, or download "
+           "the PDF or CSV from your bank's site."
+           if no_text else
            "No PDF reader is installed on the server: run "
            "`pip install pdfplumber` and restart.")
     )
 
 
+_IMAGE_MAGIC = (b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'II*\x00', b'MM\x00*')
+
+
+def _image_text(data: bytes) -> Tuple[str, str, Dict[str, Any]]:
+    """A photo or screenshot of a statement, uploaded as the image itself."""
+    from PIL import Image
+    import io
+    if not _ocr_engine():
+        raise ValueError(
+            "That's a picture, and the server has no OCR installed to read "
+            "pictures. Install it once and restart:\n"
+            "    pip install rapidocr-onnxruntime")
+    img = Image.open(io.BytesIO(data))
+    texts = []
+    for frame in range(min(getattr(img, 'n_frames', 1), OCR_MAX_PAGES)):  # multi-page TIFF
+        img.seek(frame)
+        texts.append(_ocr_pil(img.copy()))
+    text = "\n".join(texts)
+    if not text.strip():
+        raise ValueError("I couldn't read any words in that picture - try a "
+                         "sharper, straight-on photo.")
+    return text, 'ocr (image)', {'pages': len(texts),
+                                 'ocr_pages': list(range(1, len(texts) + 1)),
+                                 'ocr_images': 0, 'ocr_missing': False,
+                                 'ocr_skipped': 0}
+
+
 def statement_text_from_upload(filename: str, data: bytes) -> Tuple[str, str]:
+    text, reader, _info = statement_text_and_info(filename, data)
+    return text, reader
+
+
+def statement_text_and_info(filename: str,
+                            data: bytes) -> Tuple[str, str, Dict[str, Any]]:
     name = (filename or '').lower()
     if name.endswith('.pdf') or data[:5] == b'%PDF-':
-        return _pdf_text(data)
+        return _pdf_text_info(data)
+    if name.endswith(('.png', '.jpg', '.jpeg', '.gif', '.tif', '.tiff', '.bmp', '.webp')) \
+            or data[:4].startswith(_IMAGE_MAGIC):
+        return _image_text(data)
     for enc in ('utf-8', 'utf-8-sig', 'latin-1'):
         try:
-            return data.decode(enc), 'text'
+            return data.decode(enc), 'text', {}
         except UnicodeDecodeError:
             continue
-    raise ValueError("I can read a PDF, or a plain text or CSV export. "
-                     "That file is neither.")
+    raise ValueError("I can read a PDF (including scanned ones), a photo of a "
+                     "statement, or a plain text or CSV export. That file is "
+                     "none of those.")
+
+
+def _ocr_note(info: Optional[Dict[str, Any]]) -> str:
+    """One line for the operator when some of what they see came from OCR."""
+    if not info:
+        return ''
+    bits = []
+    if info.get('ocr_pages'):
+        p = info['ocr_pages']
+        bits.append(f"page{'s' if len(p) > 1 else ''} {', '.join(map(str, p))} "
+                    f"{'were' if len(p) > 1 else 'was'} a picture")
+    if info.get('ocr_images'):
+        n = info['ocr_images']
+        bits.append(f"{n} picture{'s' if n > 1 else ''} inside the pages")
+    note = ''
+    if bits:
+        note = ("Read with OCR: " + " and ".join(bits) + ". OCR can misread a "
+                "digit, so check the amounts and dates on those rows.")
+    if info.get('ocr_missing'):
+        note += (" Some pages are pictures I couldn't read - no OCR is installed "
+                 "on the server (pip install rapidocr-onnxruntime).")
+    if info.get('ocr_skipped'):
+        note += (f" {info['ocr_skipped']} picture page(s) were skipped "
+                 f"(OCR_MAX_PAGES={OCR_MAX_PAGES}).")
+    return note.strip()
 
 
 @app.post("/api/statement/preview", dependencies=[Depends(get_ledger_context)])
@@ -8065,7 +8769,11 @@ async def api_statement_preview(file: UploadFile = File(...),
                 f"PDF is normally well under a megabyte - if yours is large "
                 f"it is probably a scan, which has no text to read.")
 
-        text, reader = statement_text_from_upload(file.filename or '', data)
+        # OCR can take a while on a scanned statement - keep it off the event
+        # loop so the rest of the app stays responsive meanwhile.
+        from starlette.concurrency import run_in_threadpool
+        text, reader, read_info = await run_in_threadpool(
+            statement_text_and_info, file.filename or '', data)
         parsed = parse_statement_text(text)
         print(f"STATEMENT: {file.filename!r} via {reader} -> "
               f"{len(parsed['rows'])} rows, {len(parsed['unreadable'])} unreadable, "
@@ -8076,6 +8784,13 @@ async def api_statement_preview(file: UploadFile = File(...),
             conn, parsed, filename=file.filename or 'statement',
             bank_text=bank_account)
         out.pop('_final', None)
+        out['reader'] = reader
+        note = _ocr_note(read_info)
+        if note:
+            out['ocr_note'] = note
+            for k in ('message', 'analysis'):
+                if isinstance(out.get(k), str):
+                    out[k] = out[k].rstrip() + "\n\n" + note
         return out
     except ValueError as e:
         t = str(e)
