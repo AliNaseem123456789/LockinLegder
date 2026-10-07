@@ -412,6 +412,14 @@ AUTO_CREATE_MISC = os.getenv("AUTO_CREATE_MISC", "1") != "0"
 MISC_INCOME_NAME = os.getenv("MISC_INCOME_NAME", "Miscellaneous Income")
 MISC_EXPENSE_NAME = os.getenv("MISC_EXPENSE_NAME", "Miscellaneous Expense")
 
+# A name on the line that matches no profile goes to the shared Unknown
+# profile (the panel offers "create <name> as a new vendor" instead). 0 brings
+# back the old behaviour: a new profile is created for it on save.
+UNKNOWN_FOR_NEW_PARTIES = os.getenv("UNKNOWN_FOR_NEW_PARTIES", "1") != "0"
+# One model call to tidy the suggested name for a NEW account, typed lines
+# only (never per statement row). 0 = the rule-based name only.
+LLM_ACCOUNT_NAMES = os.getenv("LLM_ACCOUNT_NAMES", "1") != "0"
+
 # acc_trans_m flags.  PHP defaults include_in_billing to the form checkbox
 # (unchecked = 0); v4 hardcoded 1.  Kept configurable so billing reports do
 # not change under you without a decision.
@@ -3536,6 +3544,160 @@ def _category_suggestion_lines(msg: str, sug: Dict[str, Any],
     return out[:4]
 
 
+# ==========================================================================
+# Not an exact match -> Miscellaneous now, and two offers in the review panel
+#
+#   "Use <nearest>"     the closest account that already exists
+#   "Create <name>"     a new account, name suggested from the line
+#
+# The voucher is never left without an account: Miscellaneous is the safe
+# default and the panel can save it as it stands. A guess is never put in the
+# field any more - it is OFFERED, one click away, instead.
+# ==========================================================================
+def _is_exact_match(res) -> bool:
+    return res is not None and (res.match_type in _CONFIDENT_MATCHES
+                                or res.score >= 0.90)
+
+
+# Words that never belong in an account name. The cost words (fees, charges,
+# premium...) are kept OUT of this list on purpose: "Bank Fees" is a name,
+# "Bank" isn't.
+_NAME_NOISE = (_CAT_NOISE - {'fee', 'fees', 'cost', 'costs', 'charge', 'charges',
+                             'dues', 'premium', 'premiums'}) | frozenset("""
+via on at in by per is was his her their its our your we us me i
+purchase purchased bought renewal renew renewed online order ordered
+transaction txn ref reference inv no number zelle ach wire transfer debit
+credit card pos visa mastercard amex check cheque cash received
+voucher vouchers receipt receipts
+""".split())
+_NAME_ENDINGS = {'expense', 'expenses', 'income', 'revenue', 'revenues', 'fee',
+                 'fees', 'cost', 'costs', 'sales', 'charges', 'wages', 'salaries',
+                 'payroll', 'rent', 'insurance', 'interest', 'commission',
+                 'commissions', 'tax', 'taxes'}
+
+
+def _suggest_account_name(text: str, entry_type: str,
+                          party_name: Optional[str] = None) -> str:
+    """
+    "annual software subscription" -> "Software Subscription Expense".
+    What the money was FOR, never who it went to: the party's own words,
+    digits and filler are dropped. '' when nothing meaningful is left.
+    """
+    party = _significant_words(party_name or '')
+    kept: List[str] = []
+    for w in re.split(r"[\s/,;:#()\-]+", text or ''):
+        w = w.strip(".'\"")
+        c = _cat_word(w)
+        if len(c) < 3 or c in _NAME_NOISE or c in party or any(ch.isdigit() for ch in c):
+            continue
+        if c not in {_cat_word(k) for k in kept}:
+            kept.append(w)
+    kept = kept[:3]
+    if not kept:
+        return ''
+    name = title_case_name(' '.join(kept))
+    if _cat_word(kept[-1]) not in _NAME_ENDINGS:
+        name += ' Income' if entry_type == 'CRV' else ' Expense'
+    return name
+
+
+_NAME_SYSTEM = ("You name accounts in a small business's chart of accounts. "
+                "Reply with JSON only, exactly like {\"name\": \"Software "
+                "Subscription Expense\"} - no other text.")
+
+
+def _llm_account_name(line: str, entry_type: str, existing: List[str],
+                      party_name: Optional[str], fallback: str) -> Optional[str]:
+    """One model call to improve the rule-based name. Thrown away unless it
+    passes every check below - so the worst case is the rule-based name."""
+    if not LLM_ACCOUNT_NAMES or not line or not _llm_available():
+        return None
+    kind = 'income - money received' if entry_type == 'CRV' else 'expense - money paid out'
+    suffix = 'Income' if entry_type == 'CRV' else 'Expense'
+    user = (f"Transaction: \"{line}\"\n"
+            f"Type: {kind}\n"
+            f"Existing {'income' if entry_type == 'CRV' else 'expense'} accounts, "
+            f"for naming style: {', '.join(existing[:15]) or '(none)'}\n"
+            f"A first guess at the name: {fallback or '(none)'}\n\n"
+            f"Rules:\n"
+            f"- 2 to 4 words, Title Case.\n"
+            f"- Name WHAT the money was for, never WHO: no vendor or customer "
+            f"names, no dates, amounts, invoice or reference numbers.\n"
+            f"- End with \"{suffix}\" unless the existing accounts clearly don't "
+            f"use that suffix.\n"
+            f"- Must not repeat an existing account name.\n"
+            f"- General enough to reuse for similar transactions next month.")
+    out = _llm_ask(_NAME_SYSTEM, user, max_tokens=600)
+    if not out:
+        return None
+    m = re.search(r'\{.*?\}', out, re.S)
+    try:
+        name = str(json.loads(m.group(0)).get('name', '')).strip() if m else ''
+    except Exception:
+        name = ''
+    if not name or len(name) > 60 or any(ch.isdigit() for ch in name):
+        return None
+    if not (2 <= len(name.split()) <= 5) or not re.fullmatch(r"[A-Za-z&' \-]+", name):
+        return None
+    if _significant_words(name) & _significant_words(party_name or ''):
+        return None
+    if normalize_name(name) in {normalize_name(e) for e in existing}:
+        return None
+    return title_case_name(name)
+
+
+def _category_offer(conn, entry_type: str, natures: set, search_text: str,
+                    weak_row: Optional[Dict], party_name: Optional[str], *,
+                    line: Optional[str] = None, use_llm: bool = False) -> Dict[str, Any]:
+    """
+    What the panel offers when there is no exact match:
+      nearest   {code, qualified, desc} - an account that already exists
+      new_*     a suggested name for a new account and where it would go
+    """
+    misc_row = find_misc_account(conn, entry_type, natures)
+    sug = (_category_suggestions(conn, search_text, natures, entry_type)
+           if search_text and search_text.strip() else None)
+    nearest = weak_row
+    if nearest is None and sug and sug['close'] and not sug.get('close_loose'):
+        nearest = sug['close'][0]
+    if nearest is not None and misc_row is not None and nearest['code'] == misc_row['code']:
+        nearest = None
+
+    name = _suggest_account_name(search_text or line or '', entry_type, party_name)
+    if use_llm:
+        existing = [r['desc'] for r in chart_by_nature(conn, natures) if r.get('desc')]
+        better = _llm_account_name(line or search_text, entry_type, existing,
+                                   party_name, name)
+        if better:
+            name = better
+    # A suggested name that already exists IS the account - offer it as the
+    # nearest instead of offering to create a duplicate.
+    if name:
+        same = next((r for r in chart_by_nature(conn, natures)
+                     if normalize_name(r['desc']) == normalize_name(name)), None)
+        if same is not None:
+            if nearest is None:
+                nearest = same
+            name = ''
+
+    if sug and sug.get('heading'):
+        h = sug['heading']
+        level, parent_code, parent_label = 'sub', h['code'], h['name']
+    else:
+        level = 'main'
+        parent_code = _misc_nature(entry_type)
+        parent_label = NATURE_LABEL.get(parent_code, parent_code)
+
+    return {
+        'nearest': ({'code': nearest['code'], 'qualified': nearest['qualified'],
+                     'desc': nearest['desc']} if nearest else None),
+        'new_name': name,
+        'new_level': level,
+        'new_parent_code': parent_code,
+        'new_parent_label': parent_label,
+    }
+
+
 def _bank_samples(conn, limit: int = 3) -> List[str]:
     rows = [r for r in get_chart(conn) if r['nature'] == NATURE_ASSET]
     names = sorted({r['desc'] for r in rows if r.get('desc')}, key=lambda x: (len(x), x))
@@ -6075,7 +6237,8 @@ Return ONLY valid JSON, no markdown, no extra text.
                                     'why': _internal_error_message(
                                         e, "reading that line")})
                     continue
-                if draft.get('party_is_new') and draft.get('party_name'):
+                if draft.get('party_is_new') and draft.get('party_name') \
+                        and draft.get('party_name') != UNKNOWN_PARTY_NAME:
                     key = normalize_name(draft['party_name'])
                     seen_new_party[key] = seen_new_party.get(key, 0) + 1
                 drafts.append(draft)
@@ -6111,6 +6274,7 @@ Return ONLY valid JSON, no markdown, no extra text.
         party_name, party_why = statement_party(r.description)
 
         # ---- Party: matched, never created --------------------------------
+        party_original = None
         party_code = party_display = None
         party_match_type, party_score = 'none', 0.0
         party_type = P_TYPE_CUSTOMER if r.entry_type == 'CRV' else P_TYPE_VENDOR
@@ -6123,6 +6287,13 @@ Return ONLY valid JSON, no markdown, no extra text.
                 exact = normalize_name(party_display) == normalize_name(party_name)
                 party_match_type = 'exact' if exact else 'fuzzy'
                 party_score = 1.0 if exact else name_similarity(party_name, party_display)
+            elif UNKNOWN_FOR_NEW_PARTIES:
+                party_original = title_case_name(party_name)
+                party_code = find_unknown_party(conn)
+                party_display = UNKNOWN_PARTY_NAME
+                party_type = UNKNOWN_PARTY_TYPE
+                party_match_type = 'exact' if party_code else 'new'
+                party_score = 1.0 if party_code else 0.0
             else:
                 party_display = title_case_name(party_name)
                 party_match_type = 'new'
@@ -6148,58 +6319,47 @@ Return ONLY valid JSON, no markdown, no extra text.
             raise ValueError(
                 f"There are no {kind} accounts in this company's chart yet, so "
                 f"there is nothing to post the other side of this row to.")
-        category_matched = cat_res is not None
         cat_note = None
         cat_guess = None
-        kind = 'income' if r.entry_type == 'CRV' else 'expense'
-        # What happened to this row's account, in one word, so the statement
-        # card can count them and the client can move a whole group at once:
-        #   matched  read off the line with confidence
-        #   guessed  a weak match (fuzzy, the model, the concept net)
-        #   misc     nothing matched - filed under Miscellaneous
-        #   missing  nothing matched and there's no Miscellaneous to use
-        category_status = 'matched'
-
-        # A weak match is a guess, exactly as on a typed line. Before this a
-        # bank memo that the model mapped to SOMETHING was shown as matched,
-        # so nothing ever reached Miscellaneous and nothing said "check me".
-        if cat_res is not None and cat_res.match_type not in _CONFIDENT_MATCHES \
-                and cat_res.score < 0.90:
+        category_offer = None
+        misc_info = None
+        if _is_exact_match(cat_res):
+            category_matched = True
+            category_status = 'exact'
+        else:
+            # Same rule as a typed line: Miscellaneous now, the nearest and a
+            # new account offered in the panel. Offers are worked out once
+            # per counterparty, like the category itself.
+            okey = ('offer', normalize_name(party_name or r.description)[:60], r.entry_type)
+            if cat_cache is not None and okey in cat_cache:
+                category_offer = dict(cat_cache[okey])
+            else:
+                weak_row = find_account(conn, cat_res.code) if cat_res is not None else None
+                category_offer = _category_offer(conn, r.entry_type, natures,
+                                                 r.description, weak_row, party_name)
+                if cat_cache is not None:
+                    cat_cache[okey] = dict(category_offer)
             category_matched = False
-            category_status = 'guessed'
-            misc_row = find_misc_account(conn, r.entry_type, natures)
-            cat_guess = AccountProblem(
-                f"Guessed from the statement line - nothing in your chart is "
-                f"named for it. If it's wrong:\n"
-                f"1. pick the right account here\n"
-                f"2. create one: add {kind} category <name>\n"
-                f"3. put it under Miscellaneous"
-                + (f" ({misc_row['qualified']})" if misc_row else "")
-                + " - or use the button on the statement card to move every "
-                  "guess there at once.",
-                "Guessed - check it")
-
-        if not cat_res:
             cat_res, _d = _default_category_resolution(conn, r.entry_type, natures)
-            if cat_res:
+            if cat_res is not None:
                 category_status = 'misc'
+                misc_info = {'code': cat_res.code, 'qualified': cat_res.qualified}
                 cat_guess = AccountProblem(
-                    f"Nothing in your chart matches this line, so it's under "
-                    f"{cat_res.qualified} for now. To file it properly: pick an "
-                    f"account here, or create one with \"add {kind} category "
-                    f"<name>\".",
-                    "No match - under Miscellaneous")
+                    f"No exact match in your chart, so it's under "
+                    f"{cat_res.qualified} for now.",
+                    "No exact match - Miscellaneous")
             else:
                 category_status = 'missing'
                 cat_note = AccountProblem(
-                    "The line doesn't match any account and there's no "
-                    "Miscellaneous account to fall back on, so pick the one "
-                    "this belongs to.",
+                    "No exact match and no Miscellaneous account to fall back "
+                    "on, so pick the one this belongs to.",
                     "Not matched - choose it")
 
         review: List[str] = []
         if party_why:
             review.append(f'no name on this line ({party_why}) - filed under Unknown')
+        if party_original:
+            review.append(f'"{party_original}" is not in your ledger - filed under Unknown')
         if statement_is_transfer(r.description):
             # The one reading that is quietly wrong rather than obviously
             # wrong: money moved between two accounts this company already
@@ -6221,6 +6381,8 @@ Return ONLY valid JSON, no markdown, no extra text.
             r.entry_type, party_match_type, party_score,
             bank_res.match_type, bank_res.score,
             category_matched, False, base=review)
+        if party_display == UNKNOWN_PARTY_NAME:
+            review = [i for i in review if not i.startswith('new ')]
 
         # A date, not a datetime: _draft_payload isoformats this straight into
         # the draft, and a datetime would put "2025-08-01T00:00:00" where every
@@ -6244,6 +6406,9 @@ Return ONLY valid JSON, no markdown, no extra text.
 
         d = payload['draft']
         d['category_status'] = category_status
+        d['category_offer'] = category_offer
+        d['misc_account'] = misc_info
+        d['party_original_name'] = party_original
         d['draft_id'] = f"stmt-{index}"
         d['statement_line'] = r.line_no
         d['statement_section'] = r.section
@@ -6273,14 +6438,18 @@ Return ONLY valid JSON, no markdown, no extra text.
                     misc_accounts[et] = {'code': row['code'],
                                          'qualified': row['qualified']}
         counts = {k: sum(1 for d in drafts if d.get('category_status') == k)
-                  for k in ('matched', 'guessed', 'misc', 'missing')}
+                  for k in ('exact', 'misc', 'missing')}
+        counts['nearest'] = sum(1 for d in drafts
+                                if d.get('category_status') != 'exact'
+                                and (d.get('category_offer') or {}).get('nearest'))
         money_in = sum(d['amount'] for d in crv)
         money_out = sum(d['amount'] for d in cpv)
         needs = [d for d in drafts if not d.get('category_acc_code')
                  or not d.get('party_code') and not d.get('party_name')]
         dups = [d for d in drafts if d.get('duplicate_of')]
         new_parties = sorted({d['party_name'] for d in drafts
-                              if d.get('party_is_new') and d.get('party_name')})
+                              if d.get('party_is_new') and d.get('party_name')
+                              and d['party_name'] != UNKNOWN_PARTY_NAME})
 
         dates = sorted({d['transaction_date'] for d in drafts})
         span = (f"{_pretty_date(dates[0])}"
@@ -6298,21 +6467,14 @@ Return ONLY valid JSON, no markdown, no extra text.
             lines += ["", f"{len(new_parties)} name{'' if len(new_parties) == 1 else 's'} "
                           f"aren't in your ledger yet; each one gets a profile "
                           f"when you save that row."]
-        if counts['guessed'] or counts['misc']:
-            bits = []
-            if counts['matched']:
-                bits.append(f"{counts['matched']} matched an account")
-            if counts['guessed']:
-                bits.append(f"{counts['guessed']} "
-                            + ("is a guess" if counts['guessed'] == 1 else "are guesses")
-                            + " to check")
-            if counts['misc']:
-                bits.append(f"{counts['misc']} matched nothing and are under "
-                            f"Miscellaneous")
-            lines += ["", "Accounts: " + ", ".join(bits) + "."
-                      + (" The card below can move the guesses - or every "
-                         "row - to Miscellaneous in one go."
-                         if counts['guessed'] or counts['matched'] else "")]
+        if counts['misc']:
+            lines += ["", f"Accounts: {counts['exact']} matched exactly, "
+                          f"{counts['misc']} went to Miscellaneous"
+                          + (f" ({counts['nearest']} of them "
+                             f"{'has' if counts['nearest'] == 1 else 'have'} a near match "
+                             f"you can switch to - one at a time on the right, "
+                             f"or all at once from the card below)"
+                             if counts['nearest'] else "") + "."]
         if needs:
             lines += ["", f"{len(needs)} row{'' if len(needs) == 1 else 's'} still "
                           f"need an account picking."]
@@ -6827,6 +6989,19 @@ Return ONLY valid JSON, no markdown, no extra text.
             party_code, party_display, party_match_type, party_score, party_type = \
                 resolve_party(conn, party_name, entry_type, create_missing=False)
 
+            # A name that matches no profile goes to Unknown; the panel can
+            # still turn it into a new profile with one click.
+            party_original = None
+            if party_code is None and not party_defaulted and UNKNOWN_FOR_NEW_PARTIES:
+                party_original = party_display or party_name
+                party_code = find_unknown_party(conn)
+                party_name = party_display = UNKNOWN_PARTY_NAME
+                party_type = UNKNOWN_PARTY_TYPE
+                party_match_type, party_score = (('exact', 1.0) if party_code
+                                                 else ('new', 0.0))
+                review_items.append(f'"{party_original}" is not in your ledger '
+                                    f'- filed under Unknown')
+
             # ---- Statement-line account: route it to the leg its nature implies
             # "06/04/2026 Current Assets - JOHN SMITH 659.25"  -> asset  -> bank leg
             # "06/04/2026 DR Rent Expense - LANDLORD 2400.00"  -> expense-> category leg
@@ -6870,6 +7045,12 @@ Return ONLY valid JSON, no markdown, no extra text.
                 bank_note = t
 
             # ---- Category leg ----
+            #
+            # Exact match -> that account. Anything else -> Miscellaneous (or
+            # the company's configured default), and the panel OFFERS the
+            # nearest existing account and a new one. A guess is never put
+            # in the field: Miscellaneous is the safe default, and the entry
+            # can be saved as it stands.
             natures = CRV_INCOME_NATURES if entry_type == 'CRV' else CPV_EXPENSE_NATURES
             category_hint = extracted.get('category_hint')
             cat_res, cat_err = resolve_category_account(conn, category_hint, natures)
@@ -6886,116 +7067,67 @@ Return ONLY valid JSON, no markdown, no extra text.
                 return {'status': 'error', 'message': t, 'analysis': t,
                         'confidence': 'low', '_final': True}
 
-            category_matched = cat_res is not None
-            cat_note = cat_err if cat_res is None else None
-            cat_guess: Optional[AccountProblem] = None
-            # The ladder, built once and used by every branch below: the close
-            # matches, a heading to add under, a name for a new category, and
-            # Miscellaneous. Costs one pass over the chart already in memory.
-            cat_sug = (_category_suggestions(conn, category_hint, natures, entry_type)
-                       if category_hint else None)
-
-            # ---- A weak match is still a guess -------------------------------
-            #
-            # _resolve hands back an account the MODEL chose with the same
-            # shape as one the matcher was sure of, so category_matched came
-            # out True and nothing was flagged - while the bank leg beside it
-            # flags exactly this case. A health-insurance payment landed on
-            # Insurance Expense and the operator was never told it was a
-            # guess. Same rule both legs now: a pick that isn't exact, by
-            # code, or a default, is shown as a guess with the alternatives.
-            if cat_res is not None and cat_res.match_type not in (
-                    'exact', 'code', 'default', 'substring_number') \
-                    and cat_res.score < 0.90:
-                category_matched = False
-                shared = (_significant_words(category_hint or '')
-                          & _significant_words(cat_res.desc))
-                because = (f"matched on \"{sorted(shared)[0]}\""
-                           if shared else "the closest thing in your chart")
-                cat_guess = AccountProblem(
-                    (f"Chosen because it was {because} - nothing in your chart "
-                     f"is named for this.\n\n"
-                     + _category_help_text(cat_sug, picked=cat_res.qualified)
-                     if cat_sug else
-                     f"Chosen because it was {because}."),
-                    f"Guessed from \"{category_hint}\" - check it")
-
-            # Named, but nothing in the chart matches it - exact, fuzzy, the
-            # model and the synonym net have all had their turn inside
-            # resolve_category_account. File it under Miscellaneous instead of
-            # leaving it blank, and flag it so it gets checked before saving.
-            #
-            # Preview only: a direct post (preview=false) has nobody to show
-            # the choice to, so it asks instead - see the branch below.
-            if cat_res is None and cat_err and preview:
-                misc_row, misc_new = ensure_misc_account(conn, entry_type, natures)
-                if misc_row:
-                    misc = Resolution(misc_row, 'default', 0.0)
-                    if cat_sug is not None:
-                        cat_sug['misc'] = misc_row
-                        cat_sug['misc_created'] = cat_sug.get('misc_created') or misc_new
-                    cat_res, category_matched = misc, False
-                    # cat_note still held the "nothing matches" error from
-                    # above, and the draft read that as "category missing" -
-                    # so the panel showed it empty although it had been filled.
-                    cat_note = None
-                    cat_guess = AccountProblem(
-                        f"Nothing in your chart matches \"{category_hint}\", so for "
-                        f"now it's under {misc.qualified}. Pick one of these, or "
-                        f"change it in the panel:"
-                        + ("\n\n" + _category_help_text(cat_sug, picked=misc.qualified)
-                           if cat_sug else ""),
-                        "No match - under Miscellaneous for now")
-
-            if cat_res is None and cat_err and not preview:
-                # A named category that matches nothing must never be silently
-                # rerouted somewhere else on a direct post.
-                return _clarify_reply(
-                    msg=msg, note=cat_err,
-                    suggestions=(_category_suggestion_lines(msg, cat_sug, entry_type)
-                                 if cat_sug else
-                                 [_line_with_category(msg, n, entry_type)
-                                  for n in _sample_accounts(conn, natures, 2)]),
-                    amount=amount, party=party_display, entry_type=entry_type,
-                    bank=bank_res.qualified if bank_res else None,
-                    date=trans_date.isoformat())
-
-            # A named category that resolved to nothing: say what the chart
-            # DOES have, what to create, and where to put it otherwise -
-            # instead of the old "nothing matches, type show chart".
-            if cat_res is None and cat_err and cat_sug:
-                cat_note = AccountProblem(
-                    f"Nothing in your chart matches \"{category_hint}\".\n\n"
-                    + _category_help_text(cat_sug),
-                    f"No category matches \"{category_hint}\"")
-            if not cat_res and not cat_err:
+            if not category_hint:
+                # Nothing named: the rest of the sentence may still name it.
                 cat_res, _ = resolve_category_account(
-                    conn, f"{party_name} {description}", natures)
-                category_matched = cat_res is not None
-                if not cat_res:
-                    cat_res, default_err = _default_category_resolution(
-                        conn, entry_type, natures)
-                    category_matched = False
-                    if cat_res is not None and getattr(cat_res, 'just_created', False):
-                        kind = 'income' if entry_type == 'CRV' else 'expense'
-                        cat_guess = AccountProblem(
-                            f"The line doesn't say what this was for, so it's under "
-                            f"{cat_res.qualified}. Your chart had no Miscellaneous "
-                            f"{kind} account, so I added this one. Change it in the "
-                            f"panel if it belongs somewhere else.",
-                            "Not named - under Miscellaneous")
-                    if not cat_res:
-                        t = default_err or "Could not determine the category account."
-                        cat_suggestions = [_line_with_category(msg, n, entry_type)
-                                           for n in _sample_accounts(conn, natures, 2)]
-                        if not preview:
-                            return _clarify_reply(
-                                msg=msg, note=t, suggestions=cat_suggestions,
-                                amount=amount, party=party_display,
-                                entry_type=entry_type,
-                                bank=bank_res.qualified if bank_res else None,
-                                date=trans_date.isoformat())
-                        cat_note = default_err
+                    conn, f"{party_original or party_name} {description}", natures)
+
+            cat_note = None
+            cat_guess: Optional[AccountProblem] = None
+            cat_sug = None                      # the panel carries the offers now
+            category_offer = None
+            misc_info = None
+            if _is_exact_match(cat_res):
+                category_matched = True
+                category_status = 'exact'
+            else:
+                weak_row = find_account(conn, cat_res.code) if cat_res is not None else None
+                category_offer = _category_offer(
+                    conn, entry_type, natures,
+                    category_hint or (description if extracted.get('description') else ''),
+                    weak_row, party_original or party_name, line=msg,
+                    use_llm=preview)
+                fallback, default_err = _default_category_resolution(
+                    conn, entry_type, natures)
+
+                if not preview and category_hint:
+                    # A direct post has nobody to show the choice to, so it asks.
+                    sug_lines = []
+                    if category_offer['nearest']:
+                        sug_lines.append(_line_with_category(
+                            msg, category_offer['nearest']['desc'], entry_type))
+                    if category_offer['new_name']:
+                        sug_lines.append(f"add {'income' if entry_type == 'CRV' else 'expense'} "
+                                         f"category {category_offer['new_name']}")
+                    if fallback is not None:
+                        sug_lines.append(_line_with_category(msg, fallback.desc, entry_type))
+                    return _clarify_reply(
+                        msg=msg, note=cat_err or f"Nothing in your chart exactly "
+                                                 f"matches \"{category_hint}\".",
+                        suggestions=sug_lines, amount=amount, party=party_display,
+                        entry_type=entry_type,
+                        bank=bank_res.qualified if bank_res else None,
+                        date=trans_date.isoformat())
+
+                cat_res = fallback
+                category_matched = False
+                if fallback is not None:
+                    category_status = 'misc'
+                    misc_info = {'code': fallback.code, 'qualified': fallback.qualified}
+                    near = category_offer['nearest']
+                    cat_guess = AccountProblem(
+                        f"No exact match in your chart, so it's under "
+                        f"{fallback.qualified} for now."
+                        + (f" Nearest existing account: {near['qualified']}." if near else "")
+                        + (f" Or create \"{category_offer['new_name']}\"."
+                           if category_offer['new_name'] else ""),
+                        "No exact match - Miscellaneous")
+                else:
+                    category_status = 'missing'
+                    cat_note = AccountProblem(
+                        default_err or "No exact match and no Miscellaneous account "
+                                       "to fall back on - pick one here.",
+                        "Not matched - choose it")
             if not cat_res:
                 unresolved.append('category account')
 
@@ -7015,6 +7147,8 @@ Return ONLY valid JSON, no markdown, no extra text.
                 bank_res.score if bank_res else 0.0,
                 category_matched or cat_res is not None,
                 bool(extracted.get('_direction_inferred')), base=review_items)
+            if party_display == UNKNOWN_PARTY_NAME:
+                review_items = [i for i in review_items if not i.startswith('new ')]
             # The collector already flags a leg that matched poorly; an
             # unresolved one replaces that entry rather than doubling it.
             for what in unresolved:
@@ -7071,7 +7205,7 @@ Return ONLY valid JSON, no markdown, no extra text.
             # Nothing has been written at this point: resolve_party ran with
             # create_missing=False, and the two account legs are lookups.
             if preview:
-                return self._draft_payload(
+                payload = self._draft_payload(
                     msg=msg, entry_type=entry_type, amount=amount,
                     trans_date=trans_date, party_code=party_code,
                     party_display=party_display, party_type=party_type,
@@ -7082,6 +7216,12 @@ Return ONLY valid JSON, no markdown, no extra text.
                     extraction_source=extracted.get('_source'),
                     bank_note=bank_note, cat_note=cat_note, cat_guess=cat_guess,
                     suggestions=suggestions)
+                d = payload['draft']
+                d['category_status'] = category_status
+                d['category_offer'] = category_offer
+                d['misc_account'] = misc_info
+                d['party_original_name'] = party_original
+                return payload
 
             # ---- Post ----
             # Everything has resolved; now the party may safely be created.

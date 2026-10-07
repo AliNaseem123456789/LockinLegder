@@ -891,23 +891,23 @@ const StatementCard = ({ card, flush, onBulkMisc, active }) => {
             Accounts
           </Typography>
           <Typography sx={{ fontSize: 11.5, color: C.inkMid }}>
-            <b>{counts.matched}</b> matched
-            {' · '}<b style={{ color: counts.guessed ? C.warn : undefined }}>
-              {counts.guessed}</b> guessed
-            {' · '}<b>{counts.misc}</b> under Miscellaneous
+            <b>{counts.exact ?? 0}</b> exact match
+            {' · '}<b>{counts.misc ?? 0}</b> under Miscellaneous
+            {counts.nearest ? <> ({counts.nearest} with a possible match)</> : null}
             {counts.missing ? <>{' · '}<b style={{ color: C.err }}>{counts.missing}</b> missing</> : null}
           </Typography>
           <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 0.9 }}>
-            {counts.guessed + counts.missing > 0 ? (
+            {counts.nearest ? (
               <Button
                 size="small"
                 disabled={!active}
-                onClick={() => onBulkMisc?.('guessed', misc)}
+                onClick={() => onBulkMisc?.('nearest', misc)}
                 sx={{ minHeight: 26, px: 1, fontSize: 12, borderRadius: '5px',
-                      color: C.warn, border: `1px solid #FEDF89`,
-                      '&:hover': { background: C.warnSoft, borderColor: C.warn } }}
+                      color: '#fff', background: C.accent,
+                      '&:hover': { background: '#16304F' },
+                      '&.Mui-disabled': { background: '#E8EBF0', color: C.inkMute } }}
               >
-                Move the {counts.guessed + counts.missing} guessed to Miscellaneous
+                Use the possible match on {counts.nearest} row{counts.nearest === 1 ? '' : 's'}
               </Button>
             ) : null}
             <Button
@@ -923,8 +923,8 @@ const StatementCard = ({ card, flush, onBulkMisc, active }) => {
           </Box>
           <Typography sx={{ mt: 0.6, fontSize: 11, color: C.inkMute }}>
             {active
-              ? `Changes only the rows not saved yet — ${Object.entries(misc)
-                  .map(([t, a]) => `${t} → ${a.qualified}`).join(', ')}.`
+              ? 'Changes only the rows not saved yet. Each row can also be switched '
+                + 'on its own on the right.'
               : 'This statement’s review is closed.'}
           </Typography>
         </Box>
@@ -1459,14 +1459,18 @@ const EditDraftFields = ({ draft, set, pickers, parties }) => {
 // wins - so the panel opens as a plain document you can read in one pass, and
 // the controls only appear when you press Edit.
 // -----------------------------------------------------------------------------
-const PV = ({ label, value, wide, tone, note, ai, aiLabel = 'Note' }) => (
+const PV = ({ label, value, wide, tone, note, ai, aiLabel = 'Note', badge }) => (
   <Box sx={{ px: 1.75, py: 0.75, minWidth: 0,
              gridColumn: wide ? '1 / -1' : 'auto',
              borderBottom: `1px solid ${C.line}` }}>
-    <Typography sx={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '0.07em',
-                      color: C.inkMute, lineHeight: 1.6 }}>
-      {label}
-    </Typography>
+    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+               gap: 1 }}>
+      <Typography sx={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '0.07em',
+                        color: C.inkMute, lineHeight: 1.6 }}>
+        {label}
+      </Typography>
+      {badge ? <Pill label={badge[0]} tone={badge[1]} /> : null}
+    </Box>
     <Typography sx={{ fontSize: 13, lineHeight: 1.45, overflowWrap: 'anywhere',
                       color: !value ? C.inkMute : tone === 'warn' ? C.warn : C.ink }}>
       {value || '—'}
@@ -1489,6 +1493,224 @@ const PreviewGrid = ({ children }) => (
     {children}
   </Box>
 );
+
+// Where the account on a voucher came from, as a label on the field.
+const CATEGORY_BADGE = {
+  exact: ['Exact Match', 'ok'],
+  misc: ['Miscellaneous', 'neutral'],
+  chosen: ['Your choice', 'accent'],
+  created: ['New account', 'ok'],
+};
+
+// One choice inside the offer box.
+const OfferRow = ({ label, title, sub, children }) => (
+  <Box sx={{ px: 1.25, py: 0.9, borderTop: `1px solid ${C.goldLine}` }}>
+    <Typography sx={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '0.07em',
+                      color: C.gold }}>
+      {label}
+    </Typography>
+    {title ? (
+      <Typography sx={{ fontSize: 13, fontWeight: 600, color: C.ink, mt: 0.2,
+                        overflowWrap: 'anywhere' }}>
+        {title}
+      </Typography>
+    ) : null}
+    {sub ? (
+      <Typography sx={{ fontSize: 11, color: C.inkMid, lineHeight: 1.4 }}>{sub}</Typography>
+    ) : null}
+    <Box sx={{ mt: 0.75, display: 'flex', flexWrap: 'wrap', gap: 0.75,
+               alignItems: 'center' }}>
+      {children}
+    </Box>
+  </Box>
+);
+
+const offerBtn = (primary) => ({
+  minHeight: 28, px: 1.25, fontSize: 12, fontWeight: 600, borderRadius: '6px',
+  ...(primary
+    ? { background: C.accent, color: '#fff', '&:hover': { background: '#16304F' },
+        '&.Mui-disabled': { background: '#E8EBF0', color: C.inkMute } }
+    : { color: C.inkMid, border: `1px solid ${C.line}`, background: C.surface,
+        '&:hover': { borderColor: C.lineStrong, background: C.raised } }),
+});
+
+// No exact account match: the voucher already sits under Miscellaneous, and
+// this box offers the two ways off it - the nearest existing account, or a
+// new one. Nothing here is required; Save works as it stands.
+const CategoryOffer = ({ draft, set, onCreateAccount }) => {
+  const offer = draft.category_offer;
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState(offer?.new_name || '');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const identity = `${draftKey(draft)}:${draft.source_message || ''}`;
+  useEffect(() => {
+    setCreating(false); setName(offer?.new_name || ''); setErr('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [identity]);
+
+  if (!offer || draft.category_status === 'exact') return null;
+  const isCRV = draft.entry_type === 'CRV';
+  const nearest = offer.nearest;
+  const misc = draft.misc_account;
+  const using = (code) => code && String(draft.category_acc_code) === String(code);
+  const kindWord = isCRV ? 'income' : 'expense';
+
+  const pick = (acc, status) => set({
+    category_acc_code: acc.code, category_account: acc.qualified,
+    category_status: status, category_matched: status !== 'misc',
+    category_note: null,
+    category_note_short: status === 'misc' ? 'No exact match - Miscellaneous' : null,
+  });
+
+  const create = async () => {
+    const n = name.trim();
+    if (!n) { setErr('Give the account a name.'); return; }
+    setBusy(true); setErr('');
+    try {
+      const acc = await onCreateAccount({ name: n, level: offer.new_level,
+                                          parent_code: offer.new_parent_code });
+      set({
+        category_acc_code: acc.code, category_account: acc.label,
+        category_status: 'created', category_matched: true,
+        category_note: null, category_note_short: null,
+        category_offer: { ...offer, created: { code: acc.code, qualified: acc.label } },
+      });
+      setCreating(false);
+    } catch (e) {
+      setErr(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Box sx={{ mx: 1.25, mt: 1, mb: 0.5, border: `1px solid ${C.goldLine}`,
+               borderRadius: '8px', background: C.goldSoft, overflow: 'hidden',
+               flexShrink: 0 }}>
+      <Box sx={{ px: 1.25, py: 0.8, display: 'flex', alignItems: 'center', gap: 0.6 }}>
+        <AutoAwesomeIcon sx={{ fontSize: 13, color: C.gold }} />
+        <Typography sx={{ fontSize: 11.5, fontWeight: 700, color: C.ink }}>
+          {draft.category_status === 'misc' || draft.category_status === 'missing'
+            ? `No exact ${kindWord} account — saved under Miscellaneous for now`
+            : `${isCRV ? 'Income' : 'Expense'} account: ${draft.category_account}`}
+        </Typography>
+      </Box>
+
+      {nearest ? (
+        <OfferRow label="POSSIBLE MATCH" title={nearest.qualified}
+                  sub="The most similar account in your chart.">
+          {using(nearest.code)
+            ? <Pill label="Using this" tone="accent" />
+            : <Button size="small" sx={offerBtn(true)}
+                      onClick={() => pick(nearest, 'chosen')}>
+                Use this account
+              </Button>}
+        </OfferRow>
+      ) : null}
+
+      {offer.created ? (
+        <OfferRow label="NEW ACCOUNT" title={offer.created.qualified}
+                  sub="Added to your chart of accounts.">
+          {using(offer.created.code)
+            ? <Pill label="Using this" tone="ok" />
+            : <Button size="small" sx={offerBtn(true)}
+                      onClick={() => pick(offer.created, 'created')}>
+                Use this account
+              </Button>}
+        </OfferRow>
+      ) : (
+        <OfferRow label="CREATE NEW ACCOUNT"
+                  title={creating ? null : (offer.new_name || null)}
+                  sub={creating ? null
+                    : `${offer.new_name ? '' : 'Name it yourself. '}`
+                      + `Goes under ${offer.new_parent_label}.`}>
+          {creating ? (
+            <Box sx={{ width: '100%' }}>
+              <TextField
+                fullWidth size="small" autoFocus value={name}
+                placeholder={`New ${kindWord} account name`}
+                onChange={(e) => setName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') create(); }}
+                sx={{ '& .MuiOutlinedInput-root': { fontSize: 13, background: C.surface,
+                                                    borderRadius: '6px' } }}
+              />
+              <Typography sx={{ fontSize: 10.5, color: C.inkMute, mt: 0.4 }}>
+                Goes under {offer.new_parent_label}
+              </Typography>
+              {err ? (
+                <Typography sx={{ fontSize: 11, color: C.err, mt: 0.4 }}>{err}</Typography>
+              ) : null}
+              <Box sx={{ display: 'flex', gap: 0.75, mt: 0.75 }}>
+                <Button size="small" disabled={busy || !name.trim()} sx={offerBtn(true)}
+                        onClick={create}
+                        startIcon={busy ? <CircularProgress size={12} thickness={5}
+                                                            sx={{ color: 'inherit' }} />
+                                        : <AddIcon sx={{ fontSize: 15 }} />}>
+                  {busy ? 'Creating…' : 'Create and use'}
+                </Button>
+                <Button size="small" disabled={busy} sx={offerBtn(false)}
+                        onClick={() => { setCreating(false); setErr(''); }}>
+                  Cancel
+                </Button>
+              </Box>
+            </Box>
+          ) : (
+            <Button size="small" sx={offerBtn(!nearest)}
+                    startIcon={<AddIcon sx={{ fontSize: 15 }} />}
+                    onClick={() => setCreating(true)}>
+              {offer.new_name ? `Create ${offer.new_name}` : 'Create new account'}
+            </Button>
+          )}
+        </OfferRow>
+      )}
+
+      {misc && !using(misc.code) ? (
+        <Box sx={{ px: 1.25, py: 0.7, borderTop: `1px solid ${C.goldLine}` }}>
+          <Button size="small" onClick={() => pick(misc, 'misc')}
+                  sx={{ fontSize: 11.5, color: C.inkMid, px: 0.5, minHeight: 22 }}>
+            ← Back to Miscellaneous
+          </Button>
+        </Box>
+      ) : null}
+    </Box>
+  );
+};
+
+// A name on the line that isn't a saved profile goes to Unknown. One click
+// turns it into a new profile instead (created when the voucher is saved).
+const PartyOffer = ({ draft, set }) => {
+  const orig = draft.party_original_name;
+  if (!orig) return null;
+  const isCRV = draft.entry_type === 'CRV';
+  const who = isCRV ? 'customer' : 'vendor';
+  const asNew = draft.party_choice === 'new';
+  return (
+    <Box sx={{ mx: 1.25, mt: 1, mb: 0.5, px: 1.25, py: 0.9, borderRadius: '8px',
+               border: `1px solid ${C.line}`, background: C.raised, flexShrink: 0 }}>
+      <Typography sx={{ fontSize: 11.5, color: C.inkMid, lineHeight: 1.45 }}>
+        {asNew
+          ? <>A new {who} <b>{orig}</b> will be created when you save.</>
+          : <><b>{orig}</b> isn’t a saved {who}, so this goes to <b>Unknown</b>.</>}
+      </Typography>
+      <Button
+        size="small"
+        sx={{ ...offerBtn(false), mt: 0.75 }}
+        startIcon={asNew ? null : <PersonAddIcon sx={{ fontSize: 15 }} />}
+        onClick={() => (asNew
+          ? set({ ...(draft.party_unknown || {}), party_choice: 'unknown' })
+          : set({
+              party_unknown: { party_code: draft.party_code, party_name: draft.party_name,
+                               party_is_new: draft.party_is_new },
+              party_code: null, party_name: orig, party_is_new: true,
+              party_choice: 'new',
+            }))}
+      >
+        {asNew ? 'Use Unknown instead' : `Save ${orig} as a new ${who}`}
+      </Button>
+    </Box>
+  );
+};
 
 const DraftPreview = ({ draft, kind }) => {
   const isCRV = draft.entry_type === 'CRV';
@@ -1551,7 +1773,8 @@ const DraftPreview = ({ draft, kind }) => {
         ? '' : `$${money(draft.amount)}`} />
       <PV label={isCRV ? 'RECEIVED FROM' : 'PAY TO'} wide
           value={draft.party_name || ''}
-          note={draft.party_is_new ? 'New — created when you post' : undefined}
+          note={draft.party_is_new && draft.party_name !== 'Unknown'
+            ? 'New — created when you post' : undefined}
           ai aiLabel="Auto-Note" />
       <PV label="BANK / CASH" value={draft.bank_account} wide
           note={draft.bank_acc_code ? undefined
@@ -1564,11 +1787,12 @@ const DraftPreview = ({ draft, kind }) => {
           sixty rows means approving sixty guesses that all look certain. */}
       <PV label={isCRV ? 'INCOME ACCOUNT' : 'EXPENSE ACCOUNT'} wide
           value={draft.category_account}
+          badge={CATEGORY_BADGE[draft.category_status]}
           note={draft.category_acc_code && draft.category_matched === false
+                && !draft.category_offer
             ? (draft.category_note_short || 'Default used') : undefined}
           ai aiLabel="Reason"
-          tone={draft.category_acc_code && draft.category_matched !== false
-            ? undefined : 'warn'} />
+          tone={draft.category_acc_code ? undefined : 'warn'} />
       <PV label="REFERENCE" value={draft.cheque_no ? `Check #${draft.cheque_no}` : ''} />
       {/* On a statement row the remark IS the statement line, which is already
           shown above in the box that says where it came from. Printing it
@@ -1580,7 +1804,7 @@ const DraftPreview = ({ draft, kind }) => {
 };
 
 const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, posting,
-                      error, queue }) => {
+                      error, queue, onCreateAccount }) => {
   const isCRV = draft.entry_type === 'CRV';
   const bankOptions = useMemo(() => toAccountOptions(pickers.bank), [pickers.bank]);
   const catOptions = useMemo(
@@ -1822,6 +2046,15 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
 
       {/* Fields — the document, or the form that corrects it */}
       <Box sx={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+        {/* No exact account match / a name that isn't a saved profile: the
+            entry is already complete (Miscellaneous, Unknown), and these
+            offer the one-click ways off the defaults. */}
+        {kind === 'voucher' ? (
+          <>
+            <CategoryOffer draft={draft} set={set} onCreateAccount={onCreateAccount} />
+            <PartyOffer draft={draft} set={set} />
+          </>
+        ) : null}
         {!editing ? <DraftPreview draft={draft} kind={kind} />
          : kind === 'party' ? <PartyDraftFields draft={draft} set={set} pickers={pickers} />
          : kind === 'account' ? <AccountDraftFields draft={draft} set={set} />
@@ -1928,7 +2161,8 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
             value={findAcc(catOptions, draft.category_acc_code)}
             onChange={(e, v) => set({ category_acc_code: v?.code || '',
                                       category_account: v?.label || '',
-                                      category_matched: true })}
+                                      category_matched: true,
+                                      category_status: v ? 'chosen' : 'missing' })}
             isOptionEqualToValue={(o, v) => o.code === v?.code}
             getOptionLabel={(o) => o?.label || ''}
             renderInput={(params) => (
@@ -2116,6 +2350,9 @@ const REVIEW_COPY = [
    'Nothing in your message named this account, so I filled in a default.'],
   [/^(customer|vendor)$/i, 'the name',
    'I matched this name loosely to an existing profile — check it is the right one.'],
+  [/is not in your ledger - filed under Unknown/i, 'the name',
+   'This name isn’t a saved profile, so the entry goes to Unknown — you can save '
+   + 'it as a new profile on the right.'],
   [/^DIRECTION/i, 'the direction',
    'Your line did not say whether the money came in or went out, so I worked it '
    + 'out from the wording.'],
@@ -2130,7 +2367,16 @@ const reviewCopy = (item) => {
 // The one line above a draft. Something I could not work out at all is a
 // different message from something I guessed, and saying both in one sentence
 // reads as gibberish ("check the bank/cash account - choose it here").
-const draftHeadline = (items = []) => {
+const draftHeadline = (items = [], d = null) => {
+  const base = draftHeadlineBase(items);
+  if (d && (d.category_status === 'misc')) {
+    return `${base} No exact account match, so it’s under Miscellaneous for now — `
+      + 'switch it on the right if you like.';
+  }
+  return base;
+};
+
+const draftHeadlineBase = (items = []) => {
   const needed = (items || []).filter((i) => i.includes('choose it here'))
     .map((i) => i.replace(' - choose it here', ''));
   const guessed = (items || []).filter((i) => !i.includes('choose it here'));
@@ -3429,7 +3675,7 @@ export default function App() {
             id,
             type: 'bot',
             timestamp: new Date(),
-            content: draftHeadline(data.review_items),
+            content: draftHeadline(data.review_items, data.draft),
             suggestions: data.suggestions || [],
             draft: d,
           },
@@ -3680,22 +3926,23 @@ export default function App() {
       // The row on screen may have edits that aren't in the queue yet.
       const cur = i === queue.index && draft ? draft : d;
       if (queue.saved.has(draftKey(cur))) return cur;
-      const m = (miscAccounts || {})[cur.entry_type];
-      if (!m) return cur;
-      const wanted = scope === 'all'
-        || ['guessed', 'missing'].includes(cur.category_status);
-      if (!wanted || String(cur.category_acc_code) === String(m.code)) return cur;
+      // 'nearest': rows still on Miscellaneous that have a possible match.
+      // 'all':     every row onto Miscellaneous.
+      const target = scope === 'nearest'
+        ? (['misc', 'missing'].includes(cur.category_status)
+            ? cur.category_offer?.nearest : null)
+        : (cur.misc_account || (miscAccounts || {})[cur.entry_type]);
+      if (!target || String(cur.category_acc_code) === String(target.code)) return cur;
       moved += 1;
       return {
         ...cur,
-        category_acc_code: m.code,
-        category_account: m.qualified,
-        category_status: 'misc',
-        // The operator chose this, so it is no longer the assistant's guess.
-        category_matched: true,
+        category_acc_code: target.code,
+        category_account: target.qualified,
+        category_status: scope === 'nearest' ? 'chosen' : 'misc',
+        category_matched: scope === 'nearest',
         category_guessed: false,
         category_note: null,
-        category_note_short: null,
+        category_note_short: scope === 'nearest' ? null : 'No exact match - Miscellaneous',
         review_items: (cur.review_items || []).filter(
           (r) => !/^category/i.test(r)),
       };
@@ -3706,9 +3953,44 @@ export default function App() {
       setDraft(drafts[queue.index]);
     }
     showSnack(moved
-      ? `${moved} row${moved === 1 ? '' : 's'} moved to Miscellaneous — still unsaved`
-      : 'Nothing to move', moved ? 'success' : 'info');
+      ? `${moved} row${moved === 1 ? '' : 's'} switched to `
+        + `${scope === 'nearest' ? 'their possible match' : 'Miscellaneous'} — still unsaved`
+      : 'Nothing to change', moved ? 'success' : 'info');
   }, [queue, draft, showSnack]);
+
+  // "Create new account" from the review panel. Uses the same endpoint as the
+  // Add Chart of Account flow, then hands back the new account's code and
+  // its name as the chart shows it, so the panel can switch to it at once.
+  const normName = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const createAccountForDraft = useCallback(async ({ name, level, parent_code }) => {
+    const { data } = await api.post('/api/commit/account', {
+      session_id: sessionId, name, level, parent_code,
+    });
+    if (data.status === 'error' || !data.card?.code) {
+      throw new Error(data.message || 'The account could not be created.');
+    }
+    const code = String(data.card.code);
+    let label = `${data.card.parent_name}/${data.card.name}`;
+    try {
+      const a = await api.get('/api/accounts');
+      const all = a.data?.all || a.data?.accounts || [];
+      const hit = all.find((x) => String(x.code) === code);
+      if (hit?.qualified) label = hit.qualified;
+    } catch { /* the approximate label is fine */ }
+    checkConnection();
+    showSnack(`${data.card.name} added to the chart`, 'success');
+    // Other rows of the same statement that suggested this same new name now
+    // point at the account instead of offering to create it twice.
+    setQueue((q) => (q ? {
+      ...q,
+      drafts: q.drafts.map((d) => (d.category_offer
+        && normName(d.category_offer.new_name) === normName(name)
+        ? { ...d, category_offer: { ...d.category_offer, new_name: '',
+                                    nearest: { code, qualified: label, desc: name } } }
+        : d)),
+    } : q));
+    return { code, label };
+  }, [api, sessionId, checkConnection, showSnack]);
 
   const discardDraft = () => {
     setDraft(null);
@@ -3779,6 +4061,7 @@ export default function App() {
       onDiscard={discardDraft}
       posting={posting}
       error={postError}
+      onCreateAccount={createAccountForDraft}
       queue={queue ? {
         index: queue.index,
         total: queue.drafts.length,
