@@ -779,7 +779,8 @@ const AccountCard = ({ card, onCommand, flush }) => (
 // READ, and nothing was written. So it is a manifest — counts, totals, and
 // what still needs a hand — rather than a receipt. The vouchers themselves
 // arrive one at a time in the review panel.
-const StatementCard = ({ card, flush, onBulkMisc, active }) => {
+const StatementCard = ({ card, flush, onBulkMisc, active, currentDraft, rowNumber,
+                         onDraftPatch, onCreateAccount }) => {
   const [showSkipped, setShowSkipped] = useState(false);
   // How each row's account was settled, counted by the server, and the
   // Miscellaneous account for each side - so a whole file's guesses can be
@@ -924,9 +925,28 @@ const StatementCard = ({ card, flush, onBulkMisc, active }) => {
           <Typography sx={{ mt: 0.6, fontSize: 11, color: C.inkMute }}>
             {active
               ? 'Changes only the rows not saved yet. Each row can also be switched '
-                + 'on its own on the right.'
+                + 'on its own below.'
               : 'This statement’s review is closed.'}
           </Typography>
+        </Box>
+      ) : null}
+
+      {/* The row open on the right, and its choices - they change it there. */}
+      {currentDraft && (currentDraft.category_offer || currentDraft.party_original_name) ? (
+        <Box sx={{ mt: 1.25, pt: 1, borderTop: `1px solid ${C.line}` }}>
+          <Typography sx={{ fontSize: 10.5, color: C.inkMute, textTransform: 'uppercase',
+                            letterSpacing: '0.06em', mb: 0.3 }}>
+            Row {rowNumber} — open on the right
+          </Typography>
+          {currentDraft.statement_text ? (
+            <Mono sx={{ fontSize: 11, color: C.inkMid, display: 'block',
+                        overflowWrap: 'anywhere' }}>
+              {currentDraft.statement_text}
+            </Mono>
+          ) : null}
+          <CategoryOffer draft={currentDraft} set={onDraftPatch}
+                         onCreateAccount={onCreateAccount} />
+          <PartyOffer draft={currentDraft} set={onDraftPatch} />
         </Box>
       ) : null}
 
@@ -1585,15 +1605,16 @@ const CategoryOffer = ({ draft, set, onCreateAccount }) => {
   };
 
   return (
-    <Box sx={{ mx: 1.25, mt: 1, mb: 0.5, border: `1px solid ${C.goldLine}`,
+    <Box sx={{ mt: 1.25, border: `1px solid ${C.goldLine}`,
                borderRadius: '8px', background: C.goldSoft, overflow: 'hidden',
-               flexShrink: 0 }}>
+               maxWidth: 520 }}>
       <Box sx={{ px: 1.25, py: 0.8, display: 'flex', alignItems: 'center', gap: 0.6 }}>
         <AutoAwesomeIcon sx={{ fontSize: 13, color: C.gold }} />
         <Typography sx={{ fontSize: 11.5, fontWeight: 700, color: C.ink }}>
           {draft.category_status === 'misc' || draft.category_status === 'missing'
-            ? `No exact ${kindWord} account — saved under Miscellaneous for now`
-            : `${isCRV ? 'Income' : 'Expense'} account: ${draft.category_account}`}
+            ? `No exact ${kindWord} account — it’s under Miscellaneous on the right. `
+              + 'Want to change it?'
+            : `Now using: ${draft.category_account}`}
         </Typography>
       </Box>
 
@@ -1686,8 +1707,8 @@ const PartyOffer = ({ draft, set }) => {
   const who = isCRV ? 'customer' : 'vendor';
   const asNew = draft.party_choice === 'new';
   return (
-    <Box sx={{ mx: 1.25, mt: 1, mb: 0.5, px: 1.25, py: 0.9, borderRadius: '8px',
-               border: `1px solid ${C.line}`, background: C.raised, flexShrink: 0 }}>
+    <Box sx={{ mt: 1, px: 1.25, py: 0.9, borderRadius: '8px', maxWidth: 520,
+               border: `1px solid ${C.line}`, background: C.raised }}>
       <Typography sx={{ fontSize: 11.5, color: C.inkMid, lineHeight: 1.45 }}>
         {asNew
           ? <>A new {who} <b>{orig}</b> will be created when you save.</>
@@ -1788,9 +1809,11 @@ const DraftPreview = ({ draft, kind }) => {
       <PV label={isCRV ? 'INCOME ACCOUNT' : 'EXPENSE ACCOUNT'} wide
           value={draft.category_account}
           badge={CATEGORY_BADGE[draft.category_status]}
-          note={draft.category_acc_code && draft.category_matched === false
-                && !draft.category_offer
-            ? (draft.category_note_short || 'Default used') : undefined}
+          note={draft.category_offer && draft.category_status === 'misc'
+            ? 'No exact match — options are in the chat'
+            : (draft.category_acc_code && draft.category_matched === false
+               && !draft.category_offer
+              ? (draft.category_note_short || 'Default used') : undefined)}
           ai aiLabel="Reason"
           tone={draft.category_acc_code ? undefined : 'warn'} />
       <PV label="REFERENCE" value={draft.cheque_no ? `Check #${draft.cheque_no}` : ''} />
@@ -2046,15 +2069,9 @@ const DraftPanel = ({ draft, setDraft, pickers, parties, onPost, onDiscard, post
 
       {/* Fields — the document, or the form that corrects it */}
       <Box sx={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
-        {/* No exact account match / a name that isn't a saved profile: the
-            entry is already complete (Miscellaneous, Unknown), and these
-            offer the one-click ways off the defaults. */}
-        {kind === 'voucher' ? (
-          <>
-            <CategoryOffer draft={draft} set={set} onCreateAccount={onCreateAccount} />
-            <PartyOffer draft={draft} set={set} />
-          </>
-        ) : null}
+        {/* The right side is the summary only. The choices that change it -
+            "use the possible match", "create a new account", "save the name
+            as a new vendor" - are in the chat, under the reply. */}
         {!editing ? <DraftPreview draft={draft} kind={kind} />
          : kind === 'party' ? <PartyDraftFields draft={draft} set={set} pickers={pickers} />
          : kind === 'account' ? <AccountDraftFields draft={draft} set={set} />
@@ -2371,7 +2388,7 @@ const draftHeadline = (items = [], d = null) => {
   const base = draftHeadlineBase(items);
   if (d && (d.category_status === 'misc')) {
     return `${base} No exact account match, so it’s under Miscellaneous for now — `
-      + 'switch it on the right if you like.';
+      + 'you can change it below.';
   }
   return base;
 };
@@ -2420,7 +2437,8 @@ const friendlyNetworkError = (error) => {
 
 
 const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
-                   onStatementAccount, onStatementBulk, activeQueueSource, busy }) => {
+                   onStatementAccount, onStatementBulk, activeQueueSource, busy,
+                   liveDraft, onDraftPatch, onCreateAccount, queueIndex }) => {
   if (msg.type === 'user') {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'flex-start',
@@ -2515,7 +2533,7 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
               disableElevation
               variant={msg.draftPosted ? 'text' : 'contained'}
               disabled={msg.draftPosted}
-              onClick={() => onReopenDraft?.(msg.draft)}
+              onClick={() => onReopenDraft?.(msg.draft, msg.id)}
               sx={{ minHeight: 28, px: 1.25, fontSize: 12, borderRadius: '5px',
                     ...(msg.draftPosted
                       ? { color: C.inkMute }
@@ -2524,6 +2542,17 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
               {msg.draftPosted ? 'Done' : 'Review →'}
             </Button>
           </Box>
+        ) : null}
+        {/* No exact account / a name that isn't a saved profile. The entry on
+            the right is already complete (Miscellaneous, Unknown); these are
+            the one-click ways to change it, and they change it there at once.
+            Only shown while this draft is the one open on the right. */}
+        {msg.draft && liveDraft ? (
+          <>
+            <CategoryOffer draft={liveDraft} set={onDraftPatch}
+                           onCreateAccount={onCreateAccount} />
+            <PartyOffer draft={liveDraft} set={onDraftPatch} />
+          </>
         ) : null}
         {/* The lines the assistant offers after a refusal. They used to SEND
             on click, which made them the one list in the app that behaved
@@ -2551,7 +2580,11 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
           ? <VoucherListCard card={msg.card} onBulkEdit={onBulkEdit} busy={busy} /> : null}
         {msg.card?.kind === 'statement_summary'
           ? <StatementCard card={msg.card} flush={bare} onBulkMisc={onStatementBulk}
-                           active={activeQueueSource === msg.id} /> : null}
+                           active={activeQueueSource === msg.id}
+                           currentDraft={activeQueueSource === msg.id ? liveDraft : null}
+                           rowNumber={queueIndex + 1}
+                           onDraftPatch={onDraftPatch}
+                           onCreateAccount={onCreateAccount} /> : null}
         {msg.card?.kind === 'statement_bank_pick'
           ? <StatementBankPickCard card={msg.card} onRetry={onStatementAccount}
                                    busy={busy} flush={bare} /> : null}
@@ -4046,9 +4079,15 @@ export default function App() {
     setPostError(null);
   };
 
-  const reopenDraft = useCallback((d) => {
+  const reopenDraft = useCallback((d, msgId) => {
     setDraft(d);
+    if (msgId) setDraftMsgId(msgId);
     setPostError(null);
+  }, []);
+
+  // A choice made in the chat lands on the draft open on the right.
+  const patchDraft = useCallback((patch) => {
+    setDraft((d) => (d ? { ...d, ...patch } : d));
   }, []);
 
   const draftPanel = draft ? (
@@ -4267,6 +4306,11 @@ export default function App() {
                            onStatementAccount={retryStatementWithAccount}
                            onStatementBulk={applyMiscToQueue}
                            activeQueueSource={queue?.source ?? null}
+                           queueIndex={queue?.index ?? 0}
+                           liveDraft={draft && (draftMsgId === m.id
+                             || (queue?.source && queue.source === m.id)) ? draft : null}
+                           onDraftPatch={patchDraft}
+                           onCreateAccount={createAccountForDraft}
                            busy={posting || isLoading} />
                 ))}
                 {isLoading ? (
