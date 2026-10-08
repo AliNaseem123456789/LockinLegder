@@ -780,7 +780,7 @@ const AccountCard = ({ card, onCommand, flush }) => (
 // what still needs a hand — rather than a receipt. The vouchers themselves
 // arrive one at a time in the review panel.
 const StatementCard = ({ card, flush, onBulkMisc, active, currentDraft, rowNumber,
-                         onDraftPatch, onCreateAccount }) => {
+                         onDraftPatch, onCreateAccount, pickers }) => {
   const [showSkipped, setShowSkipped] = useState(false);
   // How each row's account was settled, counted by the server, and the
   // Miscellaneous account for each side - so a whole file's guesses can be
@@ -885,58 +885,105 @@ const StatementCard = ({ card, flush, onBulkMisc, active, currentDraft, rowNumbe
         </Box>
       ) : null}
 
-      {counts && hasMisc ? (
-        <Box sx={{ mt: 1.25, pt: 1, borderTop: `1px solid ${C.line}` }}>
-          <Typography sx={{ fontSize: 10.5, color: C.inkMute, textTransform: 'uppercase',
-                            letterSpacing: '0.06em', mb: 0.3 }}>
-            Accounts
-          </Typography>
-          <Typography sx={{ fontSize: 11.5, color: C.inkMid }}>
-            <b>{counts.exact ?? 0}</b> exact match
-            {' · '}<b>{counts.misc ?? 0}</b> under Miscellaneous
-            {counts.nearest ? <> ({counts.nearest} with a possible match)</> : null}
-            {counts.missing ? <>{' · '}<b style={{ color: C.err }}>{counts.missing}</b> missing</> : null}
-          </Typography>
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 0.9 }}>
-            {counts.nearest ? (
-              <Button
-                size="small"
-                disabled={!active}
-                onClick={() => onBulkMisc?.('nearest', misc)}
-                sx={{ minHeight: 26, px: 1, fontSize: 12, borderRadius: '5px',
-                      color: '#fff', background: C.accent,
-                      '&:hover': { background: '#16304F' },
-                      '&.Mui-disabled': { background: '#E8EBF0', color: C.inkMute } }}
-              >
-                Use the possible match on {counts.nearest} row{counts.nearest === 1 ? '' : 's'}
-              </Button>
-            ) : null}
-            <Button
-              size="small"
-              disabled={!active}
-              onClick={() => onBulkMisc?.('all', misc)}
-              sx={{ minHeight: 26, px: 1, fontSize: 12, borderRadius: '5px',
-                    color: C.inkMid, border: `1px solid ${C.line}`,
-                    '&:hover': { background: C.raised, borderColor: C.lineStrong } }}
-            >
-              Put every row under Miscellaneous
-            </Button>
+      {counts && hasMisc ? (() => {
+        const exact = counts.exact ?? 0;
+        const inMisc = (counts.misc ?? 0) + (counts.missing ?? 0);
+        const total = exact + inMisc;
+        const nearest = counts.nearest ?? 0;
+        const btn = (primary) => ({
+          minHeight: 26, px: 1, fontSize: 12, borderRadius: '5px',
+          ...(primary
+            ? { color: '#fff', background: C.accent, '&:hover': { background: '#16304F' },
+                '&.Mui-disabled': { background: '#E8EBF0', color: C.inkMute } }
+            : { color: C.inkMid, border: `1px solid ${C.line}`, background: C.surface,
+                '&:hover': { background: C.raised, borderColor: C.lineStrong } }),
+        });
+        const Opt = ({ n, title, sub, children }) => (
+          <Box sx={{ display: 'flex', gap: 1, px: 1.25, py: 0.9,
+                     borderTop: `1px solid ${C.line}`, background: C.surface }}>
+            <OptionNumber n={n} />
+            <Box sx={{ flex: 1, minWidth: 0 }}>
+              <Typography sx={{ fontSize: 12.5, fontWeight: 700, color: C.ink }}>
+                {title}
+              </Typography>
+              <Typography sx={{ fontSize: 11, color: C.inkMid, lineHeight: 1.45 }}>
+                {sub}
+              </Typography>
+              {children ? <Box sx={{ mt: 0.6 }}>{children}</Box> : null}
+            </Box>
           </Box>
-          <Typography sx={{ mt: 0.6, fontSize: 11, color: C.inkMute }}>
-            {active
-              ? 'Changes only the rows not saved yet. Each row can also be switched '
-                + 'on its own below.'
-              : 'This statement’s review is closed.'}
-          </Typography>
-        </Box>
-      ) : null}
+        );
+        return (
+          <Box sx={{ mt: 1.25, border: `1px solid ${inMisc ? C.goldLine : C.line}`,
+                     borderRadius: '8px', overflow: 'hidden' }}>
+            <Box sx={{ px: 1.25, py: 1, background: inMisc ? C.goldSoft : C.okSoft }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
+                <AccountTreeIcon sx={{ fontSize: 15, color: inMisc ? C.gold : C.ok }} />
+                <Typography sx={{ fontSize: 13, fontWeight: 700, color: C.ink }}>
+                  {exact === 0
+                    ? 'No chart of account matched'
+                    : inMisc
+                      ? `${exact} of ${total} rows matched your chart of accounts`
+                      : `All ${total} rows matched your chart of accounts`}
+                </Typography>
+                <Pill label={`${exact} exact match${exact === 1 ? '' : 'es'}`}
+                      tone={exact ? 'ok' : 'warn'} />
+              </Box>
+              {inMisc ? (
+                <Typography sx={{ fontSize: 11.5, color: C.inkMid, mt: 0.4, lineHeight: 1.5 }}>
+                  {exact === 0
+                    ? <>None of the <b style={{ color: C.ink }}>{total}</b> row{total === 1 ? '' : 's'}
+                        {' '}matched an account in your chart, so {total === 1 ? 'it is' : 'all are'}
+                        {' '}under </>
+                    : <>The other <b style={{ color: C.ink }}>{inMisc}</b> row{inMisc === 1 ? ' is' : 's are'}
+                        {' '}under </>}
+                  <b style={{ color: C.ink }}>Miscellaneous</b> for now. Here are your options:
+                </Typography>
+              ) : null}
+            </Box>
+            {inMisc ? (
+              <>
+                <Opt n={1} title="Best possible matches"
+                     sub={nearest
+                       ? `${nearest} row${nearest === 1 ? ' has' : 's have'} a similar account `
+                         + 'in your chart. Use them all at once, or pick per row below.'
+                       : 'No similar accounts were found. Rows can still be matched one '
+                         + 'by one below.'}>
+                  {nearest ? (
+                    <Button size="small" disabled={!active} sx={btn(true)}
+                            onClick={() => onBulkMisc?.('nearest', misc)}>
+                      Use best match on {nearest} row{nearest === 1 ? '' : 's'}
+                    </Button>
+                  ) : null}
+                </Opt>
+                <Opt n={2} title="Create new chart of account"
+                     sub="Per row — open a row below and create the account it should use." />
+                <Opt n={3} title="Keep in Miscellaneous (default)"
+                     sub="Already done — nothing to change. Save each row on the right.">
+                  <Button size="small" disabled={!active} sx={btn(false)}
+                          onClick={() => onBulkMisc?.('all', misc)}>
+                    Put every row back in Miscellaneous
+                  </Button>
+                </Opt>
+              </>
+            ) : null}
+            <Typography sx={{ px: 1.25, py: 0.6, fontSize: 11, color: C.inkMute,
+                              borderTop: `1px solid ${C.line}`, background: C.raised }}>
+              {active
+                ? 'Bulk buttons change only rows not saved yet.'
+                : 'This statement’s review is closed.'}
+            </Typography>
+          </Box>
+        );
+      })() : null}
 
       {/* The row open on the right, and its choices - they change it there. */}
       {currentDraft && (currentDraft.category_offer || currentDraft.party_original_name) ? (
         <Box sx={{ mt: 1.25, pt: 1, borderTop: `1px solid ${C.line}` }}>
           <Typography sx={{ fontSize: 10.5, color: C.inkMute, textTransform: 'uppercase',
                             letterSpacing: '0.06em', mb: 0.3 }}>
-            Row {rowNumber} — open on the right
+            Row {rowNumber}{counts ? ` of ${(counts.exact ?? 0) + (counts.misc ?? 0)
+              + (counts.missing ?? 0)}` : ''} — open on the right
           </Typography>
           {currentDraft.statement_text ? (
             <Mono sx={{ fontSize: 11, color: C.inkMid, display: 'block',
@@ -944,7 +991,7 @@ const StatementCard = ({ card, flush, onBulkMisc, active, currentDraft, rowNumbe
               {currentDraft.statement_text}
             </Mono>
           ) : null}
-          <CategoryOffer draft={currentDraft} set={onDraftPatch}
+          <CategoryOffer draft={currentDraft} set={onDraftPatch} pickers={pickers}
                          onCreateAccount={onCreateAccount} />
           <PartyOffer draft={currentDraft} set={onDraftPatch} />
         </Box>
@@ -1522,29 +1569,6 @@ const CATEGORY_BADGE = {
   created: ['New account', 'ok'],
 };
 
-// One choice inside the offer box.
-const OfferRow = ({ label, title, sub, children }) => (
-  <Box sx={{ px: 1.25, py: 0.9, borderTop: `1px solid ${C.goldLine}` }}>
-    <Typography sx={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '0.07em',
-                      color: C.gold }}>
-      {label}
-    </Typography>
-    {title ? (
-      <Typography sx={{ fontSize: 13, fontWeight: 600, color: C.ink, mt: 0.2,
-                        overflowWrap: 'anywhere' }}>
-        {title}
-      </Typography>
-    ) : null}
-    {sub ? (
-      <Typography sx={{ fontSize: 11, color: C.inkMid, lineHeight: 1.4 }}>{sub}</Typography>
-    ) : null}
-    <Box sx={{ mt: 0.75, display: 'flex', flexWrap: 'wrap', gap: 0.75,
-               alignItems: 'center' }}>
-      {children}
-    </Box>
-  </Box>
-);
-
 const offerBtn = (primary) => ({
   minHeight: 28, px: 1.25, fontSize: 12, fontWeight: 600, borderRadius: '6px',
   ...(primary
@@ -1554,10 +1578,100 @@ const offerBtn = (primary) => ({
         '&:hover': { borderColor: C.lineStrong, background: C.raised } }),
 });
 
-// No exact account match: the voucher already sits under Miscellaneous, and
-// this box offers the two ways off it - the nearest existing account, or a
-// new one. Nothing here is required; Save works as it stands.
-const CategoryOffer = ({ draft, set, onCreateAccount }) => {
+// ---- No chart of account matched: the three options -----------------------
+// Frontend only. The server already put the entry under Miscellaneous (option
+// 3, the default) and sent one nearest account plus a suggested new name.
+// Options 1 and 2 are the ways off Miscellaneous. Option 1 adds up to two more
+// accounts ranked here, in the browser, from the chart already loaded for the
+// pickers - no extra server call.
+
+const MATCH_NOISE = new Set([
+  'the', 'and', 'for', 'from', 'with', 'you', 'your', 'thank', 'thanks', 'payment',
+  'payments', 'paid', 'pay', 'automatic', 'auto', 'ach', 'pos', 'debit', 'credit',
+  'card', 'purchase', 'online', 'transfer', 'transaction', 'deposit', 'withdrawal',
+  'income', 'revenue', 'expense', 'expenses', 'cost', 'costs', 'other', 'general',
+  'misc', 'miscellaneous', 'account', 'inc', 'llc', 'ltd', 'co', 'com', 'www', 'www.',
+  'ref', 'id', 'no', 'des', 'indn', 'ppd', 'web', 'recurring',
+]);
+
+const matchWords = (text) =>
+  String(text || '').toLowerCase().split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 3 && !MATCH_NOISE.has(w) && !/^\d+$/.test(w));
+
+// Up to `limit` accounts, best first. The server's nearest leads the list;
+// the rest share at least one real word with what the line said.
+const bestMatchesFor = (draft, chart, limit = 3) => {
+  const offer = draft.category_offer || {};
+  const misc = draft.misc_account;
+  const out = [];
+  const seen = new Set();
+  const push = (acc, tag) => {
+    const code = String(acc?.code ?? '');
+    if (!code || seen.has(code)) return;
+    if (misc && String(misc.code) === code) return;
+    if (offer.created && String(offer.created.code) === code) return;
+    seen.add(code);
+    out.push({ code, qualified: acc.qualified || acc.label || acc.name, tag });
+  };
+  if (offer.nearest) push(offer.nearest, 'Closest');
+
+  const want = new Set(matchWords([
+    draft.statement_text, draft.party_original_name, draft.party_name,
+    draft.description, draft.source_message, offer.new_name,
+  ].filter(Boolean).join(' ')));
+  if (want.size) {
+    const scored = [];
+    (chart || []).forEach((a) => {
+      const name = a.qualified || a.label || a.name || '';
+      if (/miscellaneous/i.test(name)) return;
+      const have = matchWords(name);
+      let score = 0;
+      have.forEach((w) => {
+        if (want.has(w)) score += 2;
+        else if (w.length >= 4 && [...want].some((x) => x.length >= 4
+                 && (x.startsWith(w.slice(0, 4)) || w.startsWith(x.slice(0, 4))))) score += 1;
+      });
+      if (score > 0) scored.push({ a, score, name });
+    });
+    scored.sort((x, y) => y.score - x.score || x.name.length - y.name.length);
+    scored.forEach(({ a }) => { if (out.length < limit) push(a, null); });
+  }
+  return out.slice(0, limit);
+};
+
+const OptionNumber = ({ n, on }) => (
+  <Box sx={{ flex: '0 0 auto', width: 22, height: 22, borderRadius: '50%',
+             display: 'flex', alignItems: 'center', justifyContent: 'center',
+             fontSize: 11.5, fontWeight: 700,
+             background: on ? C.accent : C.surface, color: on ? '#fff' : C.inkMid,
+             border: `1px solid ${on ? C.accent : C.lineStrong}` }}>
+    {on ? <CheckIcon sx={{ fontSize: 14 }} /> : n}
+  </Box>
+);
+
+// One numbered option. `on` = this is what the entry uses right now.
+const OptionBlock = ({ n, title, tag, sub, on, children }) => (
+  <Box sx={{ display: 'flex', gap: 1, px: 1.25, py: 1,
+             borderTop: `1px solid ${C.line}`,
+             background: on ? C.accentSoft : C.surface,
+             boxShadow: on ? `inset 3px 0 0 ${C.accent}` : 'none' }}>
+    <OptionNumber n={n} on={on} />
+    <Box sx={{ flex: 1, minWidth: 0 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
+        <Typography sx={{ fontSize: 12.5, fontWeight: 700, color: C.ink }}>{title}</Typography>
+        {tag}
+      </Box>
+      {sub ? (
+        <Typography sx={{ fontSize: 11, color: C.inkMid, lineHeight: 1.45, mt: 0.15 }}>
+          {sub}
+        </Typography>
+      ) : null}
+      {children ? <Box sx={{ mt: 0.75 }}>{children}</Box> : null}
+    </Box>
+  </Box>
+);
+
+const CategoryOffer = ({ draft, set, onCreateAccount, pickers }) => {
   const offer = draft.category_offer;
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState(offer?.new_name || '');
@@ -1569,12 +1683,23 @@ const CategoryOffer = ({ draft, set, onCreateAccount }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identity]);
 
-  if (!offer || draft.category_status === 'exact') return null;
   const isCRV = draft.entry_type === 'CRV';
-  const nearest = offer.nearest;
+  const chart = isCRV ? pickers?.income : pickers?.expense;
+  const matches = useMemo(
+    () => (offer ? bestMatchesFor(draft, chart) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [identity, offer, chart, draft.entry_type]);
+
+  if (!offer || draft.category_status === 'exact') return null;
   const misc = draft.misc_account;
-  const using = (code) => code && String(draft.category_acc_code) === String(code);
   const kindWord = isCRV ? 'income' : 'expense';
+  const current = String(draft.category_acc_code ?? '');
+  const using = (code) => code != null && current !== '' && current === String(code);
+  const onMisc = misc ? using(misc.code)
+    : (draft.category_status === 'misc' || draft.category_status === 'missing');
+  const onMatch = matches.some((m) => using(m.code));
+  const onCreated = !!(offer.created && using(offer.created.code));
+  const lineText = draft.statement_text || '';
 
   const pick = (acc, status) => set({
     category_acc_code: acc.code, category_account: acc.qualified,
@@ -1604,96 +1729,152 @@ const CategoryOffer = ({ draft, set, onCreateAccount }) => {
     }
   };
 
+  const changed = !onMisc;
   return (
-    <Box sx={{ mt: 1.25, border: `1px solid ${C.goldLine}`,
-               borderRadius: '8px', background: C.goldSoft, overflow: 'hidden',
-               maxWidth: 520 }}>
-      <Box sx={{ px: 1.25, py: 0.8, display: 'flex', alignItems: 'center', gap: 0.6 }}>
-        <AutoAwesomeIcon sx={{ fontSize: 13, color: C.gold }} />
-        <Typography sx={{ fontSize: 11.5, fontWeight: 700, color: C.ink }}>
-          {draft.category_status === 'misc' || draft.category_status === 'missing'
-            ? `No exact ${kindWord} account — it’s under Miscellaneous on the right. `
-              + 'Want to change it?'
-            : `Now using: ${draft.category_account}`}
+    <Box sx={{ mt: 1.25, border: `1px solid ${changed ? '#D6E0EF' : C.goldLine}`,
+               borderRadius: '8px', background: C.surface, overflow: 'hidden',
+               maxWidth: 560 }}>
+      {/* Header: what happened, in one line, then what to do about it. */}
+      <Box sx={{ px: 1.25, py: 1, background: changed ? C.accentSoft : C.goldSoft }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
+          {changed
+            ? <CheckIcon sx={{ fontSize: 16, color: C.accent }} />
+            : <AccountTreeIcon sx={{ fontSize: 15, color: C.gold }} />}
+          <Typography sx={{ fontSize: 13, fontWeight: 700, color: C.ink }}>
+            {changed ? 'Account changed' : 'No chart of account matched'}
+          </Typography>
+          {!changed ? <Pill label="0 exact matches" tone="warn" /> : null}
+        </Box>
+        <Typography sx={{ fontSize: 11.5, color: C.inkMid, mt: 0.4, lineHeight: 1.5 }}>
+          {changed ? (
+            <>Now using <b style={{ color: C.ink }}>{draft.category_account}</b>.
+              {' '}You can still pick another option below.</>
+          ) : (
+            <>
+              {lineText ? <>“{lineText}” didn’t match </> : <>This entry didn’t match </>}
+              any {kindWord} account in your chart. It’s saved under
+              {' '}<b style={{ color: C.ink }}>Miscellaneous</b> for now —
+              {' '}here are your options:
+            </>
+          )}
         </Typography>
       </Box>
 
-      {nearest ? (
-        <OfferRow label="POSSIBLE MATCH" title={nearest.qualified}
-                  sub="The most similar account in your chart.">
-          {using(nearest.code)
-            ? <Pill label="Using this" tone="accent" />
-            : <Button size="small" sx={offerBtn(true)}
-                      onClick={() => pick(nearest, 'chosen')}>
-                Use this account
-              </Button>}
-        </OfferRow>
-      ) : null}
-
-      {offer.created ? (
-        <OfferRow label="NEW ACCOUNT" title={offer.created.qualified}
-                  sub="Added to your chart of accounts.">
-          {using(offer.created.code)
-            ? <Pill label="Using this" tone="ok" />
-            : <Button size="small" sx={offerBtn(true)}
-                      onClick={() => pick(offer.created, 'created')}>
-                Use this account
-              </Button>}
-        </OfferRow>
-      ) : (
-        <OfferRow label="CREATE NEW ACCOUNT"
-                  title={creating ? null : (offer.new_name || null)}
-                  sub={creating ? null
-                    : `${offer.new_name ? '' : 'Name it yourself. '}`
-                      + `Goes under ${offer.new_parent_label}.`}>
-          {creating ? (
-            <Box sx={{ width: '100%' }}>
-              <TextField
-                fullWidth size="small" autoFocus value={name}
-                placeholder={`New ${kindWord} account name`}
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') create(); }}
-                sx={{ '& .MuiOutlinedInput-root': { fontSize: 13, background: C.surface,
-                                                    borderRadius: '6px' } }}
-              />
-              <Typography sx={{ fontSize: 10.5, color: C.inkMute, mt: 0.4 }}>
-                Goes under {offer.new_parent_label}
-              </Typography>
-              {err ? (
-                <Typography sx={{ fontSize: 11, color: C.err, mt: 0.4 }}>{err}</Typography>
-              ) : null}
-              <Box sx={{ display: 'flex', gap: 0.75, mt: 0.75 }}>
-                <Button size="small" disabled={busy || !name.trim()} sx={offerBtn(true)}
-                        onClick={create}
-                        startIcon={busy ? <CircularProgress size={12} thickness={5}
-                                                            sx={{ color: 'inherit' }} />
-                                        : <AddIcon sx={{ fontSize: 15 }} />}>
-                  {busy ? 'Creating…' : 'Create and use'}
-                </Button>
-                <Button size="small" disabled={busy} sx={offerBtn(false)}
-                        onClick={() => { setCreating(false); setErr(''); }}>
-                  Cancel
-                </Button>
+      {/* 1 - best possible matches */}
+      <OptionBlock
+        n={1} on={onMatch}
+        title="Best possible matches"
+        sub={matches.length
+          ? 'Similar accounts already in your chart. None is an exact match — check before using.'
+          : `No similar ${kindWord} accounts in your chart. Try option 2 or keep option 3.`}>
+        {matches.length ? (
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+            {matches.map((m) => (
+              <Box key={m.code}
+                   sx={{ display: 'flex', alignItems: 'center', gap: 1,
+                         border: `1px solid ${using(m.code) ? '#D6E0EF' : C.line}`,
+                         borderRadius: '6px', px: 1, py: 0.6,
+                         background: using(m.code) ? C.surface : C.raised }}>
+                <Box sx={{ flex: 1, minWidth: 0 }}>
+                  <Typography sx={{ fontSize: 12.5, fontWeight: 600, color: C.ink,
+                                    overflowWrap: 'anywhere' }}>
+                    {m.qualified}
+                  </Typography>
+                  <Typography sx={{ fontSize: 10.5, color: C.inkMute }}>
+                    Code {m.code}{m.tag ? ` · ${m.tag}` : ''}
+                  </Typography>
+                </Box>
+                {using(m.code)
+                  ? <Pill label="Using this" tone="accent" />
+                  : <Button size="small" sx={offerBtn(true)}
+                            onClick={() => pick(m, 'chosen')}>
+                      Use
+                    </Button>}
               </Box>
+            ))}
+          </Box>
+        ) : null}
+      </OptionBlock>
+
+      {/* 2 - create a new chart of account */}
+      <OptionBlock
+        n={2} on={onCreated}
+        title="Create new chart of account"
+        sub={offer.created
+          ? `Added to your chart under ${offer.new_parent_label}.`
+          : `Adds a new ${offer.new_level === 'sub' ? 'sub-account' : 'account'} `
+            + `under ${offer.new_parent_label} and uses it for this entry.`}>
+        {offer.created ? (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <Typography sx={{ flex: 1, fontSize: 12.5, fontWeight: 600, color: C.ink,
+                              overflowWrap: 'anywhere' }}>
+              {offer.created.qualified}
+            </Typography>
+            {onCreated
+              ? <Pill label="Using this" tone="ok" />
+              : <Button size="small" sx={offerBtn(true)}
+                        onClick={() => pick(offer.created, 'created')}>
+                  Use
+                </Button>}
+          </Box>
+        ) : creating ? (
+          <Box>
+            <TextField
+              fullWidth size="small" autoFocus value={name}
+              placeholder={`New ${kindWord} account name`}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') create(); }}
+              sx={{ '& .MuiOutlinedInput-root': { fontSize: 13, background: C.surface,
+                                                  borderRadius: '6px' } }}
+            />
+            {err ? (
+              <Typography sx={{ fontSize: 11, color: C.err, mt: 0.4 }}>{err}</Typography>
+            ) : null}
+            <Box sx={{ display: 'flex', gap: 0.75, mt: 0.75 }}>
+              <Button size="small" disabled={busy || !name.trim()} sx={offerBtn(true)}
+                      onClick={create}
+                      startIcon={busy ? <CircularProgress size={12} thickness={5}
+                                                          sx={{ color: 'inherit' }} />
+                                      : <AddIcon sx={{ fontSize: 15 }} />}>
+                {busy ? 'Creating…' : 'Create and use'}
+              </Button>
+              <Button size="small" disabled={busy} sx={offerBtn(false)}
+                      onClick={() => { setCreating(false); setErr(''); }}>
+                Cancel
+              </Button>
             </Box>
-          ) : (
-            <Button size="small" sx={offerBtn(!nearest)}
+          </Box>
+        ) : (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+            {offer.new_name ? (
+              <Typography sx={{ fontSize: 11.5, color: C.inkMid }}>
+                Suggested name: <b style={{ color: C.ink }}>{offer.new_name}</b>
+              </Typography>
+            ) : null}
+            <Button size="small" sx={offerBtn(false)}
                     startIcon={<AddIcon sx={{ fontSize: 15 }} />}
                     onClick={() => setCreating(true)}>
-              {offer.new_name ? `Create ${offer.new_name}` : 'Create new account'}
+              Create new account
             </Button>
-          )}
-        </OfferRow>
-      )}
+          </Box>
+        )}
+      </OptionBlock>
 
-      {misc && !using(misc.code) ? (
-        <Box sx={{ px: 1.25, py: 0.7, borderTop: `1px solid ${C.goldLine}` }}>
-          <Button size="small" onClick={() => pick(misc, 'misc')}
-                  sx={{ fontSize: 11.5, color: C.inkMid, px: 0.5, minHeight: 22 }}>
-            ← Back to Miscellaneous
+      {/* 3 - Miscellaneous, the default */}
+      <OptionBlock
+        n={3} on={onMisc}
+        title="Keep in Miscellaneous"
+        tag={<Pill label="Default" tone="neutral" />}
+        sub={onMisc
+          ? `Selected. ${misc?.qualified ? `${misc.qualified} — ` : ''}`
+            + 'nothing else to do, just Save. You can reclassify it later.'
+          : `${misc?.qualified || 'Miscellaneous'} — what the entry used before you changed it.`}>
+        {!onMisc && misc ? (
+          <Button size="small" sx={offerBtn(false)} onClick={() => pick(misc, 'misc')}>
+            Move back to Miscellaneous
           </Button>
-        </Box>
-      ) : null}
+        ) : null}
+      </OptionBlock>
     </Box>
   );
 };
@@ -1707,7 +1888,7 @@ const PartyOffer = ({ draft, set }) => {
   const who = isCRV ? 'customer' : 'vendor';
   const asNew = draft.party_choice === 'new';
   return (
-    <Box sx={{ mt: 1, px: 1.25, py: 0.9, borderRadius: '8px', maxWidth: 520,
+    <Box sx={{ mt: 1, px: 1.25, py: 0.9, borderRadius: '8px', maxWidth: 560,
                border: `1px solid ${C.line}`, background: C.raised }}>
       <Typography sx={{ fontSize: 11.5, color: C.inkMid, lineHeight: 1.45 }}>
         {asNew
@@ -2438,7 +2619,7 @@ const friendlyNetworkError = (error) => {
 
 const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
                    onStatementAccount, onStatementBulk, activeQueueSource, busy,
-                   liveDraft, onDraftPatch, onCreateAccount, queueIndex }) => {
+                   liveDraft, onDraftPatch, onCreateAccount, queueIndex, pickers }) => {
   if (msg.type === 'user') {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'flex-start',
@@ -2549,7 +2730,7 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
             Only shown while this draft is the one open on the right. */}
         {msg.draft && liveDraft ? (
           <>
-            <CategoryOffer draft={liveDraft} set={onDraftPatch}
+            <CategoryOffer draft={liveDraft} set={onDraftPatch} pickers={pickers}
                            onCreateAccount={onCreateAccount} />
             <PartyOffer draft={liveDraft} set={onDraftPatch} />
           </>
@@ -2583,6 +2764,7 @@ const Message = ({ msg, onCommand, onSuggest, onReopenDraft, onBulkEdit,
                            active={activeQueueSource === msg.id}
                            currentDraft={activeQueueSource === msg.id ? liveDraft : null}
                            rowNumber={queueIndex + 1}
+                           pickers={pickers}
                            onDraftPatch={onDraftPatch}
                            onCreateAccount={onCreateAccount} /> : null}
         {msg.card?.kind === 'statement_bank_pick'
@@ -4311,6 +4493,7 @@ export default function App() {
                              || (queue?.source && queue.source === m.id)) ? draft : null}
                            onDraftPatch={patchDraft}
                            onCreateAccount={createAccountForDraft}
+                           pickers={pickers}
                            busy={posting || isLoading} />
                 ))}
                 {isLoading ? (
