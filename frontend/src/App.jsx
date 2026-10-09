@@ -3777,9 +3777,14 @@ export default function App() {
 
       if (data.status === 'draft' && data.drafts?.length) {
         const msgId = Date.now() + 1;
+        // The summary card already says everything the server's paragraph
+        // said - totals, the account, duplicates, the Miscellaneous options,
+        // "nothing has been written" - so the card is the whole reply. Server
+        // notes (OCR and the like) are for whoever runs the server, not for
+        // the person reviewing the statement, so they are not shown.
         setMessages((prev) => [...prev, {
           id: msgId, type: 'bot', timestamp: new Date(),
-          content: data.message || data.analysis || '',
+          content: data.card ? '' : (data.message || data.analysis || ''),
           card: data.card || null,
         }]);
         // `source` ties the queue to its summary card, so the card's bulk
